@@ -5,6 +5,7 @@ import {
   UNKNOWN_AFTER_RESTART,
   attemptsLeft,
   budgetGuard,
+  budgetScope,
   classifyCommand,
   evaluate,
   isParked,
@@ -44,7 +45,8 @@ import {
   type Worktree,
 } from "@mimir/protocol";
 import { emit, type EmitInput } from "../emit.js";
-import type { ReadModel } from "../readmodel.js";
+import { RUNTIME_AT_CAPACITY, isCapacityAware } from "../fleet-runtime/adapter.js";
+import type { FailedCheck, ReadModel } from "../readmodel.js";
 import { argvFor } from "../templates.js";
 import type { ArtifactStore } from "./artifacts.js";
 import type { PersistedWorktree, WorktreePort } from "./git-port.js";
@@ -52,7 +54,7 @@ import type { PrRunner } from "./pr.js";
 import { missionTransition, taskTransition, type TaskEventContext } from "./transitions.js";
 import { collectArtifactFiles, recordCollection } from "./collect.js";
 import {
-  MAX_CHECK_OUTPUT,
+  headAndTail,
   type VerificationResult,
   type Verifier,
   type VerifyBinding,
@@ -62,6 +64,7 @@ import {
   classifiedArgv,
   classifyOptions,
   memberOf,
+  projectEnv,
   projectSettings,
   testCommandOf,
 } from "./commands.js";
@@ -75,6 +78,17 @@ export const TRUST_PROMPT_STATUS = "blocked:trust_prompt";
 export const EVENT_OUTPUT_CAP = 16 * 1024;
 /** Ticks between periodic `runtime.reconcile()` liveness checks (0 disables them). */
 export const DEFAULT_RECONCILE_EVERY_TICKS = 30;
+
+/** First wait before a launch that found the runtime full is tried again; doubles per try. */
+export const CAPACITY_RETRY_MS = 2000;
+export const CAPACITY_RETRY_MAX_MS = 30_000;
+/**
+ * Longest a task waits for a free worker before its attempt fails (`FLEET_CAPACITY_TIMEOUT`).
+ * No limit by default: queueing behind long-running tasks on a small fleet is normal and must
+ * not cost attempts. Set `MIMIR_CAPACITY_WAIT_MS` to bound it where a full fleet means trouble.
+ */
+export const DEFAULT_CAPACITY_WAIT_MS = Number.POSITIVE_INFINITY;
+export const FLEET_CAPACITY_TIMEOUT = "fleet_capacity_timeout";
 
 /** The system actor that requests approvals for actions an operator asked for. */
 export const SYSTEM_ACTOR: Actor = { kind: "system", id: "mimir" };
@@ -129,6 +143,8 @@ export interface OrchestratorOptions {
   approvalTtlMs?: number;
   /** Run `runtime.reconcile()` every N ticks to catch sessions lost without an event (I5). */
   reconcileEveryTicks?: number;
+  /** Total time a task may wait for a free worker (default `DEFAULT_CAPACITY_WAIT_MS`). */
+  capacityWaitMs?: number;
   log?: OrchestratorLogger;
 }
 
@@ -167,6 +183,64 @@ export function toBudgetPolicy(b: ProtocolBudgetPolicy): BudgetPolicy {
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
+/** A `runtime_unavailable` that only says every compatible worker is busy right now. */
+const atCapacity = (err: unknown): boolean =>
+  isMimirError(err) &&
+  err.code === "runtime_unavailable" &&
+  (err.details as { reason?: unknown } | undefined)?.reason === RUNTIME_AT_CAPACITY;
+
+/**
+ * What the next attempt is told about the verification that sent the task back: per failed
+ * check its command, exit code and the end of its output (already redacted when stored). One
+ * line, no control characters: some runtimes type argv into a terminal.
+ */
+export function verificationFailureNote(checks: readonly FailedCheck[]): string | undefined {
+  if (checks.length === 0) return undefined;
+  const clean = (text: string) =>
+    [...text]
+      .map((c) => (c.charCodeAt(0) < 0x20 || c.charCodeAt(0) === 0x7f ? " " : c))
+      .join("")
+      .replace(/ {2,}/g, " ")
+      .trim();
+  const parts = checks.map((c) => {
+    const exit = c.exitCode === null ? "was killed (timeout or signal)" : `exited ${c.exitCode}`;
+    const tail = clean(redact(c.outputTail).text);
+    return `\`${clean(redact(c.command).text)}\` ${exit}${tail === "" ? "" : `; its output ended with: ${tail}`}`;
+  });
+  return `The previous attempt failed verification, fix what it reports. ${parts.join(" | ")}`;
+}
+
+const APPLY_PATCH = "git apply --check result.patch && git apply result.patch";
+const UNDO_PATCH = "git apply --reverse --check result.patch && git apply --reverse result.patch";
+
+/**
+ * The `apply` and `undo` text of a `local_delivery` artifact. A rework carries two patches (the
+ * whole change, and `followUp` for a checkout that already has the earlier delivery), or only
+ * the follow-up when the whole change could not be computed.
+ */
+export function localDeliveryInstructions(result: { followUp?: unknown; followUpOnly?: string }): {
+  apply: string;
+  undo: string;
+} {
+  if (result.followUpOnly !== undefined) {
+    const only = `"patch" holds only the follow-up to the earlier delivery (${result.followUpOnly}): `;
+    return {
+      apply: `${only}apply the earlier delivery first, then save "patch" as result.patch and run: ${APPLY_PATCH}`,
+      undo: `${only}save it as result.patch and run: ${UNDO_PATCH} (the earlier delivery stays applied)`,
+    };
+  }
+  if (result.followUp === undefined) return { apply: APPLY_PATCH, undo: UNDO_PATCH };
+  const followUp = (command: string) => command.replaceAll("result.patch", "followup.patch");
+  return {
+    apply:
+      `Already applied the earlier delivery? Save "followUp.patch" as followup.patch and run: ${followUp(APPLY_PATCH)} ` +
+      `Otherwise save "patch" (the complete change) as result.patch and run: ${APPLY_PATCH}`,
+    undo:
+      `Applied "followUp.patch"? Run: ${followUp(UNDO_PATCH)} (the earlier delivery stays applied). ` +
+      `Applied "patch"? Run: ${UNDO_PATCH}`,
+  };
+}
+
 /**
  * Joins scheduler, policy, git, runtime, store and read model. Every state change is appended to
  * the event store first; the read model then updates from the event (via `store.subscribe`).
@@ -185,6 +259,7 @@ export class Orchestrator {
   private readonly tickMs: number;
   private readonly approvalTtlMs: number;
   private readonly reconcileEveryTicks: number;
+  private readonly capacityWaitMs: number;
   private readonly log: OrchestratorLogger;
   /** Last runtime observation of each session (server clock ms): events and reconcile presence. */
   private readonly heartbeats = new Map<string, number>();
@@ -197,6 +272,14 @@ export class Orchestrator {
   private readonly renewals = new Map<string, string>();
   /** Expired leases already handled (`taskId@expiresAt`), so expire/release fire once per lease. */
   private readonly handledLeases = new Set<string>();
+  /**
+   * Tasks waiting for a free worker: since when, and for a launch the runtime refused as full,
+   * when to try again and how often it has. In memory: a restart starts the wait over.
+   */
+  private readonly capacityWaits = new Map<
+    string,
+    { since: number; until: number; tries: number }
+  >();
   private subscription: { close(): void } | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
@@ -216,6 +299,7 @@ export class Orchestrator {
     this.tickMs = options.tickMs ?? DEFAULT_TICK_MS;
     this.approvalTtlMs = options.approvalTtlMs ?? DEFAULT_APPROVAL_TTL_MS;
     this.reconcileEveryTicks = options.reconcileEveryTicks ?? DEFAULT_RECONCILE_EVERY_TICKS;
+    this.capacityWaitMs = options.capacityWaitMs ?? DEFAULT_CAPACITY_WAIT_MS;
     this.log = options.log ?? NOOP_LOG;
   }
 
@@ -324,6 +408,7 @@ export class Orchestrator {
       await this.recover("periodic");
     }
     const now = this.now();
+    this.pruneCapacityWaits();
     this.expireApprovals(now);
     this.promoteReady(now);
     const decisions = schedule({
@@ -345,6 +430,59 @@ export class Orchestrator {
       }
     }
     this.checkBudgets(now);
+  }
+
+  /** Tasks currently waiting for a free worker (diagnostics and tests). */
+  capacityWaiting(): string[] {
+    return [...this.capacityWaits.keys()];
+  }
+
+  /** Forgets the wait of every task that is no longer waiting (cancelled, done, mission over). */
+  private pruneCapacityWaits(): void {
+    for (const id of this.capacityWaits.keys()) {
+      const task = this.rm.tasks.get(id);
+      const waiting =
+        task !== undefined &&
+        this.rm.missions.get(task.missionId)?.status === "active" &&
+        (["ready", "leased", "verifying"].includes(task.status) ||
+          (task.status === "failed" && attemptsLeft(task)));
+      if (!waiting) this.capacityWaits.delete(id);
+    }
+  }
+
+  /**
+   * A ready task found the runtime full before anything was leased or launched: it stays ready
+   * and nothing is appended. Once it has waited `capacityWaitMs` in total the attempt fails, so
+   * the task is retried or fails for good like after any other launch failure.
+   */
+  private awaitCapacity(task: Task, crew: Crew, now: Date): void {
+    const wait = this.capacityWaits.get(task.id);
+    if (!wait) {
+      this.capacityWaits.set(task.id, { since: now.getTime(), until: 0, tries: 0 });
+      this.log.info({ taskId: task.id }, "task waits for a free worker");
+      return;
+    }
+    if (now.getTime() - wait.since < this.capacityWaitMs) return;
+    this.capacityWaits.delete(task.id);
+    this.log.warn({ taskId: task.id, waitedMs: now.getTime() - wait.since }, "no free worker");
+    // The machine fails an attempt from `leased`: the lease is granted and given up at once.
+    const leased = this.taskEvent(
+      now,
+      task,
+      {
+        type: "lease_granted",
+        crewId: crew.id as Task["crewId"],
+        leaseExpiresAt: new Date(now.getTime() + leaseTtlMs(crew)).toISOString(),
+      },
+      { agentId: newId("agt") },
+    );
+    this.taskEvent(
+      now,
+      leased,
+      { type: "runtime_failed", reason: FLEET_CAPACITY_TIMEOUT },
+      { reason: FLEET_CAPACITY_TIMEOUT },
+    );
+    this.renewals.delete(task.id);
   }
 
   private promoteReady(now: Date): void {
@@ -400,6 +538,7 @@ export class Orchestrator {
       case "dispatch": {
         if (!this.runtime) return; // no runtime configured: nothing can run
         const task = this.rm.tasks.get(d.taskId);
+        if ((this.capacityWaits.get(d.taskId)?.until ?? 0) > now.getTime()) return;
         if (task?.status === "ready") await this.dispatch(task, d.crewId, now);
         return;
       }
@@ -466,19 +605,29 @@ export class Orchestrator {
   private commandFor(
     task: Task,
     member: CrewMember,
+    project: Project | undefined,
   ): { argv: string[]; classify: string[] | null } {
     const spec = this.rm.taskSpec(task.id);
-    const brief = spec.brief ?? [task.title, task.acceptance].filter((s) => s !== "").join("\n\n");
-    const argv = spec.argv ?? argvFor(member.agentKind, member.role, brief);
-    return {
-      argv,
-      classify: classifiedArgv(
-        argv,
-        spec.argv !== undefined,
-        member.agentKind,
-        argvFor(member.agentKind, member.role, brief),
-      ),
-    };
+    const base = spec.brief ?? [task.title, task.acceptance].filter((s) => s !== "").join("\n\n");
+    // An agent member's explicit argv that is the plain template (all `POST /v1/tasks` accepts,
+    // and built there without project settings) is a template task like any other.
+    const explicit =
+      spec.argv !== undefined &&
+      (member.agentKind === "shell" ||
+        JSON.stringify(spec.argv) !== JSON.stringify(argvFor(member.agentKind, member.role, base)));
+    // Only an agent's prompt gets the note: a shell member's brief is its command, and explicit
+    // argv is run as given.
+    const note =
+      !explicit && member.agentKind !== "shell"
+        ? verificationFailureNote(this.rm.verificationFailure(task.id))
+        : undefined;
+    const argv =
+      explicit && spec.argv !== undefined
+        ? spec.argv
+        : argvFor(member.agentKind, member.role, note === undefined ? base : `${base}\n\n${note}`, {
+            codexSandbox: projectSettings(project).agent?.codexSandbox,
+          });
+    return { argv, classify: classifiedArgv(argv, explicit, member.agentKind) };
   }
 
   /** Path and branch of a task's worktree: the existing one, else where `create` will put it. */
@@ -505,7 +654,10 @@ export class Orchestrator {
       return;
     }
     const member = this.memberFor(crew);
-    const { argv, classify } = this.commandFor(task, member);
+    // Before the gate and the lease: a task that only waits for a worker appends nothing.
+    if (this.runtime && isCapacityAware(this.runtime) && this.runtime.atCapacity(member.agentKind))
+      return this.awaitCapacity(task, crew, now);
+    const { argv, classify } = this.commandFor(task, member, project);
 
     if (classify !== null) {
       const plan = this.worktreePlan(task, project, crew);
@@ -579,6 +731,8 @@ export class Orchestrator {
     expect: "leased" | "verifying";
     /** `session_started` (leased → running) or `verification_failed` (verifying → running). */
     event: TaskEvent;
+    /** Why the verification before this next attempt failed (`expect: "verifying"`). */
+    verificationFailure?: string;
   }): void {
     const stillOurs = (): Task | null => {
       const t = this.rm.tasks.get(input.taskId);
@@ -586,18 +740,50 @@ export class Orchestrator {
       if (input.expect === "leased" && t.agentId !== input.agentId) return null;
       return t;
     };
-    const failTask = (reason: string) => {
+    const failTask = (failure: string, err?: unknown) => {
       const now = this.now();
-      let current = stillOurs();
+      const current = stillOurs();
       if (!current) return;
-      if (current.status === "verifying") {
-        // verification_failed (attempts left) → running on the next attempt, which then fails
-        current = this.taskEvent(now, current, input.event, {
-          agentId: input.agentId,
-          sessionId: this.currentSession(current.id),
-        });
+      let reason = failure;
+      // A launch that failed for another reason got its slot: its capacity wait is over, so a
+      // later wait for this task starts from zero.
+      if (!atCapacity(err)) this.capacityWaits.delete(current.id);
+      if (atCapacity(err)) {
+        // Reached only when the runtime could not say so before the launch (see `dispatch`).
+        const prior = this.capacityWaits.get(current.id);
+        const since = prior?.since ?? now.getTime();
+        if (current.status === "leased" && now.getTime() - since >= this.capacityWaitMs) {
+          this.capacityWaits.delete(current.id);
+          reason = FLEET_CAPACITY_TIMEOUT;
+        } else {
+          const tries = (prior?.tries ?? 0) + 1;
+          const wait = Math.min(CAPACITY_RETRY_MAX_MS, CAPACITY_RETRY_MS * 2 ** (tries - 1));
+          this.capacityWaits.set(current.id, { since, until: now.getTime() + wait, tries });
+          if (current.status === "leased") {
+            // No free worker is not a failure of the task: it waits, and keeps its attempts.
+            this.taskEvent(now, current, { type: "launch_deferred" });
+            this.renewals.delete(current.id);
+            return;
+          }
+        }
       }
-      if (taskMachine.can(current, "runtime_failed")) {
+      if (current.status === "verifying" && atCapacity(err)) {
+        // The runtime filled up between the capacity check and the launch: the next attempt
+        // waits in ready (the backoff above applies), like a deferred dispatch.
+        this.taskEvent(
+          now,
+          current,
+          { type: "verification_deferred" },
+          { reason: input.verificationFailure ?? reason },
+        );
+        this.renewals.delete(current.id);
+        return;
+      }
+      if (current.status === "verifying") {
+        // The failed verification costs this attempt, once: the scheduler starts the next one.
+        this.taskEvent(now, current, { type: "verification_errored" }, { reason });
+        this.renewals.delete(current.id);
+      } else if (taskMachine.can(current, "runtime_failed")) {
         this.taskEvent(now, current, { type: "runtime_failed", reason }, { reason });
       }
     };
@@ -614,15 +800,23 @@ export class Orchestrator {
             const dependencies = [...this.rm.taskDependencies.values()]
               .filter((d) => d.taskId === input.taskId)
               .map((d) => d.dependsOnId);
+            // A task with dependencies inherits the mission's base through their results; only a
+            // root task has to be started from it.
+            const missionBase = dependencies.length
+              ? []
+              : (this.rm.missions.get(this.task(input.taskId).missionId)?.baseCommits ?? []);
             const dependencyBase = await this.git.dependencyBase(
               input.project.id,
               input.project.repoPath,
-              dependencies.map((id) => {
-                const commit = this.task(id).resultCommit;
-                if (!commit)
-                  throw new Error(`dependency ${id} has no immutable verified result; rerun it`);
-                return commit;
-              }),
+              [
+                ...missionBase,
+                ...dependencies.map((id) => {
+                  const commit = this.task(id).resultCommit;
+                  if (!commit)
+                    throw new Error(`dependency ${id} has no immutable verified result; rerun it`);
+                  return commit;
+                }),
+              ],
             );
             created = await this.git.create({
               ...(dependencyBase ? { baseRef: dependencyBase } : {}),
@@ -698,12 +892,20 @@ export class Orchestrator {
                 runtimeStatus: `create_failed: ${message(err)}`,
               },
             });
-            failTask(`session_create_failed: ${message(err)}`);
+            failTask(`session_create_failed: ${message(err)}`, err);
           });
         if (!runtime) {
           await failSession(new MimirError("runtime_unavailable", "no runtime configured"));
           return;
         }
+        const agent = projectSettings(this.projectOf(this.task(input.taskId))).agent;
+        const agentEnv =
+          agent?.env !== undefined || agent?.pathPrepend?.length
+            ? {
+                ...(agent.env !== undefined ? { env: agent.env } : {}),
+                ...(agent.pathPrepend?.length ? { pathPrepend: agent.pathPrepend } : {}),
+              }
+            : undefined;
         let session: RuntimeSession;
         try {
           session = await runtime.createSession({
@@ -718,6 +920,7 @@ export class Orchestrator {
               : {}),
             cwd,
             env: { MIMIR_TASK_ID: input.taskId, MIMIR_MISSION_ID: missionId },
+            ...(agentEnv !== undefined ? { agentEnv } : {}),
             workspaceLabel,
           });
         } catch (err) {
@@ -730,6 +933,7 @@ export class Orchestrator {
           // A crash or shutdown here is recovered at boot: the leased task's session is present.
           if (this.stopped) return;
           const now = this.now();
+          this.capacityWaits.delete(input.taskId);
           this.heartbeats.set(sessionId, now.getTime());
           this.emit(now, {
             type: "session.started",
@@ -931,7 +1135,7 @@ export class Orchestrator {
   private recordUnavailableUsage(
     sessionId: string,
     now: Date,
-    usage?: { tokens: number; estimatedCost: number | null },
+    usage?: { tokens: number; estimatedCost: number | null; cachedTokens?: number },
   ): void {
     const agent = [...this.rm.agents.values()].find((a) => a.runtimeSessionId === sessionId);
     const view = this.rm.sessions.get(sessionId);
@@ -950,7 +1154,10 @@ export class Orchestrator {
         sample: {
           id: newId("usg"),
           agentId,
-          tokens: usage?.tokens ?? null,
+          tokens: usage ? Math.round(usage.tokens) : null,
+          ...(usage?.cachedTokens !== undefined
+            ? { cachedTokens: Math.round(usage.cachedTokens) }
+            : {}),
           estimatedCost: usage?.estimatedCost ?? null,
           source: usage ? "measured" : "unavailable",
           createdAt: at,
@@ -998,6 +1205,8 @@ export class Orchestrator {
         harnessRef?: string;
         taskTitle: string;
         verifierConfig?: unknown;
+        env?: Record<string, string>;
+        timeoutMs?: number;
       })
     | null
   > {
@@ -1063,6 +1272,7 @@ export class Orchestrator {
     return {
       taskId: task.id,
       taskTitle: task.title,
+      ...this.verificationSettings(project),
       ...(verifierConfig !== undefined ? { verifierConfig } : {}),
       missionId: task.missionId,
       worktreePath: worktree.path,
@@ -1090,10 +1300,8 @@ export class Orchestrator {
       for (const check of result.checks) {
         this.recordArtifact(now, task, "test.output", check.output);
         const redacted = redact(check.output).text;
-        const output =
-          redacted.length > EVENT_OUTPUT_CAP
-            ? `${redacted.slice(0, EVENT_OUTPUT_CAP)}\n[truncated]`
-            : redacted;
+        // Start and end: the read model quotes the end in the next attempt's brief.
+        const output = headAndTail(redacted, EVENT_OUTPUT_CAP);
         this.emit(now, {
           type: "test.run_completed",
           streamId: `task:${task.id}`,
@@ -1105,7 +1313,7 @@ export class Orchestrator {
             passed: check.passed,
             durationMs: check.durationMs,
             exitCode: check.exitCode,
-            output: output.slice(0, MAX_CHECK_OUTPUT),
+            output,
           },
         });
       }
@@ -1127,10 +1335,10 @@ export class Orchestrator {
           JSON.stringify({ kind: "verified-result", commit, worktreeId: worktree.id }),
         );
       } catch (err) {
+        // Fails this attempt (once); the scheduler retries it while attempts are left.
         const reason = `checkpoint_failed: ${message(err)}`;
-        const failed = this.taskEvent(now, task, { type: "verification_failed" }, { reason });
-        if (failed.status === "running")
-          this.taskEvent(now, failed, { type: "runtime_failed", reason });
+        this.taskEvent(now, task, { type: "verification_errored" }, { reason });
+        this.renewals.delete(task.id);
         return;
       }
       this.taskEvent(now, task, { type: "verification_passed" }, { resultCommit });
@@ -1151,8 +1359,26 @@ export class Orchestrator {
       this.log.warn({ taskId }, "cannot start the next attempt: crew or project missing");
       return;
     }
+    if (!this.mayStart(task.missionId, crew)) {
+      // Paused mission or crew, or a budget with no room: the failed verification costs this
+      // attempt, and the scheduler starts the next one when it may (as after any failure).
+      this.taskEvent(now, task, { type: "verification_errored" }, { reason });
+      this.renewals.delete(task.id);
+      return;
+    }
     const member = this.memberFor(crew);
-    const { argv, classify } = this.commandFor(task, member);
+    if (
+      this.runtime &&
+      isCapacityAware(this.runtime) &&
+      this.runtime.atCapacity(member.agentKind)
+    ) {
+      // No free worker for the next attempt: it waits in ready and is dispatched like a new
+      // launch (see `dispatch`), instead of failing with `session_create_failed`.
+      this.taskEvent(now, task, { type: "verification_deferred" }, { reason });
+      this.renewals.delete(task.id);
+      return;
+    }
+    const { argv, classify } = this.commandFor(task, member, project);
     if (
       classify !== null &&
       classifyCommand(
@@ -1181,7 +1407,40 @@ export class Orchestrator {
       argv,
       expect: "verifying",
       event: { type: "verification_failed" },
+      verificationFailure: reason,
     });
+  }
+
+  /**
+   * Whether the scheduler would start work for `crew` in this mission now: the mission is
+   * active, the crew is scheduled and every budget that applies has room (see core `schedule`).
+   */
+  private mayStart(missionId: string, crew: Crew): boolean {
+    if (this.rm.missions.get(missionId)?.status !== "active") return false;
+    if (crew.schedulingPaused || !["configured", "running"].includes(crew.status)) return false;
+    const usage = [...this.rm.usageSamples.values()];
+    const attribution = {
+      agents: [...this.rm.agents.values()].map((a) => ({ id: a.id, crewId: a.crewId })),
+      crews: [...this.rm.crews.values()],
+    };
+    return [...this.rm.budgets.values()]
+      .map(toBudgetPolicy)
+      .filter((b) => budgetGuard.appliesTo(b, { crewId: crew.id, missionId: crew.missionId }))
+      .every(
+        (b) => budgetGuard.enforce(b, budgetGuard.evaluate(b, usage, attribution)) === "allow",
+      );
+  }
+
+  private verificationSettings(project: Project | undefined): {
+    env?: Record<string, string>;
+    timeoutMs?: number;
+  } {
+    const env = projectEnv(project);
+    const timeoutMs = projectSettings(project).verificationTimeoutMs;
+    return {
+      ...(env !== undefined ? { env } : {}),
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    };
   }
 
   private recordArtifact(now: Date, task: Task, kind: ArtifactKind, content: string): string {
@@ -1225,13 +1484,22 @@ export class Orchestrator {
   private async recover(mode: "boot" | "gap" | "periodic"): Promise<void> {
     const now = this.now();
     if (mode === "boot") await this.restoreWorktrees();
-    if (!this.runtime) return;
+    // A verification runs in this process, not in the runtime: one cut off by the restart is
+    // run again whatever the runtime answers below (also when it is down or not configured).
+    const reverify = () => {
+      if (mode !== "boot") return;
+      for (const task of this.rm.tasks.values()) {
+        if (task.status === "verifying" && !this.verifications.has(task.id))
+          this.startVerification(task.id);
+      }
+    };
+    if (!this.runtime) return reverify();
     let reconciled: { sessions: RuntimeSession[]; lost: string[] };
     try {
       reconciled = await this.runtime.reconcile();
     } catch (err) {
       this.log.error({ err: message(err) }, "runtime reconcile failed");
-      return;
+      return reverify();
     }
     const present = new Map(reconciled.sessions.map((s) => [s.sessionId, s]));
     for (const id of present.keys()) this.heartbeats.set(id, now.getTime());
@@ -1314,11 +1582,8 @@ export class Orchestrator {
       if (mode !== "boot") this.onSessionLost(sessionId, `session_lost: ${reason}`, now);
       else if (recoverable) this.markUnknown(now, this.task(task.id), sessionId);
     }
-    if (mode === "boot") {
-      for (const task of this.rm.tasks.values()) {
-        if (task.status === "verifying") this.startVerification(task.id);
-      }
-    }
+    // Not the ones a session state above just started (its task completed while Mimir was down).
+    reverify();
     // Nothing to report: no summary (fresh store; a periodic pass that found nothing).
     if (this.rm.sessions.size === 0 && reconciled.sessions.length === 0) return;
     if (mode === "periodic" && lostIds.length === 0) return;
@@ -1691,6 +1956,7 @@ export class Orchestrator {
       for (const task of [...this.rm.tasks.values()]) {
         if (task.missionId !== missionId || !taskMachine.can(task, "cancel")) continue;
         this.verifications.get(task.id)?.abort();
+        this.capacityWaits.delete(task.id);
         const sessionId = this.currentSession(task.id);
         this.taskEvent(now, task, { type: "cancel" }, { cancelReason: "mission cancelled" });
         const session = sessionId ? this.rm.sessions.get(sessionId) : undefined;
@@ -1763,6 +2029,7 @@ export class Orchestrator {
           baseRef: worktree.baseSha,
           headSha: manifest?.headSha ?? null,
           testCommand,
+          ...this.verificationSettings(project),
           ...(verifierConfig !== undefined ? { verifierConfig } : {}),
         };
       });
@@ -1919,6 +2186,7 @@ export class Orchestrator {
       project.repoPath,
       roots as string[],
       tasks.map((t) => t.resultCommit!),
+      { fromDefaultBranch: !!this.rm.missions.get(task.missionId)?.baseCommits?.length },
     );
     this.recordArtifact(
       now,
@@ -1930,8 +2198,7 @@ export class Orchestrator {
           repoPath: project.repoPath,
           taskIds: tasks.map((t) => t.id),
           format: "git-patch",
-          apply: "git apply --check result.patch && git apply result.patch",
-          undo: "git apply --reverse --check result.patch && git apply --reverse result.patch",
+          ...localDeliveryInstructions(result),
         },
         null,
         2,
@@ -1950,22 +2217,46 @@ export class Orchestrator {
     };
     for (const budget of this.rm.budgets.values()) {
       const r = budgetGuard.evaluate(toBudgetPolicy(budget), usage, attribution);
-      const unit = budget.limitTokens !== null ? ("tokens" as const) : ("cost" as const);
-      const limit = unit === "tokens" ? budget.limitTokens : budget.limitCost;
-      if (limit === null) continue;
-      const used = unit === "tokens" ? r.spentTokens : r.spentCost;
+      // Report the dimension closest to (or furthest past) its limit: with both limits set, the
+      // one that warned or ran out.
+      const dims = [
+        { unit: "tokens" as const, limit: budget.limitTokens, used: r.spentTokens },
+        { unit: "cost" as const, limit: budget.limitCost, used: r.spentCost },
+      ].filter((d): d is typeof d & { limit: number } => d.limit !== null);
+      // A zero limit (allowed at creation) is already reached; 0/0 would be NaN and never win.
+      const ratio = (d: { used: number; limit: number }) =>
+        d.limit === 0 ? (d.used > 0 ? Infinity : 1) : d.used / d.limit;
+      const top = dims.reduce<(typeof dims)[number] | undefined>(
+        (best, d) => (best === undefined || ratio(d) > ratio(best) ? d : best),
+        undefined,
+      );
+      if (top === undefined) continue;
+      const { unit, limit, used } = top;
       const ids = {
         ...(budget.missionId ? { missionId: budget.missionId } : {}),
         ...(budget.crewId ? { crewId: budget.crewId } : {}),
       };
+      const payload = {
+        budgetId: budget.id,
+        unit,
+        used,
+        limit,
+        scope: budgetScope(budget),
+        overBy: used - limit,
+        budgetVersion: budget.version,
+      };
+      // Once per budget version: an operator who changes the limits (`budget.updated`) is told
+      // again if the new limits are reached. Version 0 keeps the original id.
+      const once = (kind: string) =>
+        `${kind}:${budget.id}${budget.version > 0 ? `:v${budget.version}` : ""}`;
       // An exhausted budget reports budget.exceeded instead of a warning.
       if (r.warn && !r.exhausted) {
         this.emit(now, {
           type: "budget.warning",
           streamId: `budget:${budget.id}`,
           ...ids,
-          sourceEventId: `budget.warning:${budget.id}`,
-          payload: { budgetId: budget.id, unit, used, limit },
+          sourceEventId: once("budget.warning"),
+          payload,
         });
       }
       if (r.exhausted) {
@@ -1973,8 +2264,8 @@ export class Orchestrator {
           type: "budget.exceeded",
           streamId: `budget:${budget.id}`,
           ...ids,
-          sourceEventId: `budget.exceeded:${budget.id}`,
-          payload: { budgetId: budget.id, unit, used, limit },
+          sourceEventId: once("budget.exceeded"),
+          payload,
         });
       }
     }

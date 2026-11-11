@@ -93,6 +93,36 @@ function bump<T extends Versioned>(entity: T, at: string, patch: Partial<T>): T 
 
 class Skip extends Error {}
 
+/** One failed check of a verification, as kept for the next attempt's brief. */
+export interface FailedCheck {
+  command: string;
+  /** null when the command was killed (timeout or signal). */
+  exitCode: number | null;
+  outputTail: string;
+}
+const MAX_FAILED_CHECKS = 3;
+const FAILED_CHECK_COMMAND_CHARS = 200;
+const FAILED_CHECK_TAIL_CHARS = 1200;
+
+/** Sums samples with a per-source breakdown. Null values count as zero (see `uncertain`). */
+export function totalsOf(samples: Iterable<UsageSample>): UsageTotals {
+  const totals: UsageTotals = {
+    tokens: 0,
+    cachedTokens: 0,
+    estimatedCost: 0,
+    samples: 0,
+    bySource: { measured: 0, estimated: 0, unavailable: 0 },
+  };
+  for (const s of samples) {
+    totals.samples += 1;
+    totals.bySource[s.source] += 1;
+    totals.tokens += s.tokens ?? 0;
+    totals.cachedTokens = (totals.cachedTokens ?? 0) + (s.cachedTokens ?? 0);
+    totals.estimatedCost += s.estimatedCost ?? 0;
+  }
+  return totals;
+}
+
 /**
  * In-memory projection of the event log: missions, tasks (+ dependencies), crews, agents,
  * sessions, approvals, worktrees and usage. Built by folding events; `GET /v1/snapshot` reads it.
@@ -119,6 +149,8 @@ export class ReadModel {
   readonly approvalMeta = new Map<string, ApprovalMeta>();
   /** `task.created` brief/argv per task (what the dispatched session runs). */
   private readonly taskSpecs = new Map<string, { brief?: string; argv?: string[] }>();
+  /** Failed checks of each task's latest verification (bounded; see `verificationFailure`). */
+  private readonly failedChecks = new Map<string, FailedCheck[]>();
   /** Cursor of the last applied event; consistent with `snapshot()`. */
   cursor: string;
   /** `occurredAt` of the last applied event. */
@@ -162,6 +194,14 @@ export class ReadModel {
     return this.taskSpecs.get(taskId) ?? {};
   }
 
+  /**
+   * The failed checks of a task's latest verification (command, exit code, end of the output as
+   * stored, i.e. redacted), newest verification only. Empty once a verification passes.
+   */
+  verificationFailure(taskId: string): readonly FailedCheck[] {
+    return this.failedChecks.get(taskId) ?? [];
+  }
+
   /** Applies one event. Never throws; returns false when the event was skipped. */
   apply(event: EventEnvelope, cursor?: string): boolean {
     if (cursor !== undefined) this.cursor = cursor;
@@ -196,19 +236,7 @@ export class ReadModel {
   }
 
   usageTotals(): UsageTotals {
-    const totals: UsageTotals = {
-      tokens: 0,
-      estimatedCost: 0,
-      samples: 0,
-      bySource: { measured: 0, estimated: 0, unavailable: 0 },
-    };
-    for (const s of this.usageSamples.values()) {
-      totals.samples += 1;
-      totals.bySource[s.source] += 1;
-      totals.tokens += s.tokens ?? 0;
-      totals.estimatedCost += s.estimatedCost ?? 0;
-    }
-    return totals;
+    return totalsOf(this.usageSamples.values());
   }
 
   // -------------------------------------------------------------------------
@@ -222,9 +250,24 @@ export class ReadModel {
     // Narrowing a generic payload by `type` needs a cast per branch; keep them local.
     const p = payload as EventPayloadMap[EventType] & Record<string, unknown>;
     switch (type) {
-      case "project.created": {
+      case "project.created":
+      case "project.updated": {
         const pl = p as EventPayloadMap["project.created"];
         this.projects.set(pl.project.id, pl.project as Project);
+        return;
+      }
+      case "test.run_completed": {
+        const pl = p as EventPayloadMap["test.run_completed"];
+        if (pl.passed || event.taskId === undefined) return;
+        const checks = this.failedChecks.get(event.taskId) ?? [];
+        if (checks.length < MAX_FAILED_CHECKS) {
+          checks.push({
+            command: pl.command.slice(0, FAILED_CHECK_COMMAND_CHARS),
+            exitCode: pl.exitCode ?? null,
+            outputTail: (pl.output ?? "").slice(-FAILED_CHECK_TAIL_CHARS),
+          });
+          this.failedChecks.set(event.taskId, checks);
+        }
         return;
       }
       case "crew.scheduling_changed": {
@@ -244,6 +287,11 @@ export class ReadModel {
         this.crews.set(pl.crew.id, pl.crew as Crew);
         for (const m of pl.members) this.crewMembers.set(m.id, m as CrewMember);
         if (pl.budget) this.budgets.set(pl.budget.id, pl.budget as BudgetPolicy);
+        return;
+      }
+      case "budget.updated": {
+        const pl = p as EventPayloadMap["budget.updated"];
+        this.budgets.set(pl.budget.id, pl.budget as BudgetPolicy);
         return;
       }
       case "usage.recorded": {
@@ -274,6 +322,9 @@ export class ReadModel {
           id: id as Mission["id"],
           projectId: pl.projectId,
           objective: pl.objective,
+          ...(pl.baseCommits?.length
+            ? { baseCommits: pl.baseCommits as Mission["baseCommits"] }
+            : {}),
           status: "draft",
           createdAt: at,
           updatedAt: at,
@@ -341,6 +392,9 @@ export class ReadModel {
       case "task.started":
       case "task.failed":
       case "task.retried": {
+        // A new verification (or a pass) replaces what the previous one reported.
+        if ((type === "task.verifying" || type === "task.completed") && event.taskId)
+          this.failedChecks.delete(event.taskId);
         this.applyTask(event, type, p);
         return;
       }
@@ -509,6 +563,8 @@ export class ReadModel {
     if (to === "completed" || to === "failed" || to === "cancelled" || to === "ready") {
       patch.leaseExpiresAt = null;
     }
+    // A lease given back (`launch_deferred`) leaves no agent on the task, as in the task machine.
+    if (type === "task.ready") patch.agentId = null;
     if (type === "task.blocked")
       patch.blockedReason = (p as EventPayloadMap["task.blocked"]).reason;
     const next = bump(t, at, patch);

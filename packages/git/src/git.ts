@@ -5,7 +5,8 @@ import { MimirError } from "@mimir/protocol";
  * Config overrides applied to every git invocation. They neutralise the command-running knobs
  * that git consults during the operations Mimir performs (hooks, fsmonitor, signature
  * verification, ssh/credential helpers). Repo-local filter/merge/diff drivers are handled by the
- * config audit and by running analysis in a Mimir-owned scratch repository.
+ * config audit and by running analysis in a Mimir-owned scratch repository; transports by
+ * {@link gitEnv}.
  */
 export const SAFE_CONFIG = [
   "-c",
@@ -59,6 +60,10 @@ export function gitEnv(extra: Record<string, string> = {}): Record<string, strin
     GIT_ATTR_NOSYSTEM: "1",
     GIT_TERMINAL_PROMPT: "0",
     GIT_OPTIONAL_LOCKS: "0",
+    // Repo config can name a promisor remote (any missing object is then fetched from it) and
+    // rewrite URLs; both reach a command through `remote.*.uploadpack` or the ext transport.
+    GIT_NO_LAZY_FETCH: "1",
+    GIT_ALLOW_PROTOCOL: "file",
     ...extra,
   };
 }
@@ -149,7 +154,7 @@ const AUDIT_PATTERNS: RegExp[] = [
   /^merge\..+\.driver$/,
   /^diff\..+\.(command|textconv)$/,
   /^diff\.external$/,
-  /^core\.(sshcommand|gitproxy|fsmonitor|hookspath|askpass|editor|pager|alternaterefscommand)$/,
+  /^core\.(sshcommand|gitproxy|fsmonitor|askpass|editor|pager|alternaterefscommand)$/,
   /^credential\./,
   /^gpg\.(.+\.)?program$/,
   /^alias\./,
@@ -159,6 +164,23 @@ const AUDIT_PATTERNS: RegExp[] = [
   /^uploadpack\.packobjectshook$/,
   /^extensions\.worktreeconfig$/,
 ];
+
+/**
+ * `core.hooksPath` as husky sets it: a relative directory inside the working tree. Mimir's own
+ * git calls never run hooks (SAFE_CONFIG), so the key matters only to whoever next runs git in a
+ * checkout. A relative path resolves inside that checkout, which an agent confined to its own
+ * worktree cannot write; an absolute or escaping path could point at files an agent planted.
+ */
+function isInRepoHooksPath(value: string): boolean {
+  const path = value.trim();
+  return (
+    path.length > 0 &&
+    !path.startsWith("/") &&
+    !path.startsWith("~") &&
+    !/^[A-Za-z]:/.test(path) &&
+    !path.split(/[\\/]/).includes("..")
+  );
+}
 
 /**
  * Fails closed with `policy_denied` when the repository's own (agent-writable) config — local or
@@ -179,6 +201,8 @@ export async function auditRepoConfig(cwd: string): Promise<void> {
     const nl = kv.indexOf("\n");
     const key = (nl < 0 ? kv : kv.slice(0, nl)).toLowerCase();
     if (AUDIT_PATTERNS.some((p) => p.test(key))) keys.add(key);
+    if (key === "core.hookspath" && !isInRepoHooksPath(nl < 0 ? "" : kv.slice(nl + 1)))
+      keys.add(key);
   }
   if (keys.size > 0) {
     throw new MimirError(

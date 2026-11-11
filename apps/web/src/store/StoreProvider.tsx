@@ -49,11 +49,19 @@ export function StoreProvider({
   eventsRef.current = state.events;
   const loadedOnce = useRef(false);
 
+  // Requests can overlap (debounced refresh, banner buttons, reconnect): an answer to a request
+  // older than the one already applied is dropped, so it cannot put older data back.
+  const requestSeq = useRef(0);
+  const appliedSeq = useRef(0);
+
   const loadSnapshot = useCallback(async (): Promise<string | null> => {
     const buffered = eventsRef.current;
     const lastEventIdAtRequest = loadedOnce.current ? (buffered.at(-1)?.id ?? null) : undefined;
+    const seq = ++requestSeq.current;
     try {
       const snap = await client.snapshot();
+      if (seq < appliedSeq.current) return snap.cursor;
+      appliedSeq.current = seq;
       loadedOnce.current = true;
       dispatch({
         type: "snapshot/loaded",
@@ -68,7 +76,9 @@ export function StoreProvider({
       return snap.cursor;
     } catch (error) {
       if (isUnauthorized(error)) onUnauthorizedRef.current?.();
-      dispatch({ type: "snapshot/failed", error: describeError(error).message });
+      if (seq >= appliedSeq.current) {
+        dispatch({ type: "snapshot/failed", error: describeError(error).message });
+      }
       return null;
     }
   }, [client]);
@@ -107,6 +117,9 @@ export function StoreProvider({
             }),
           // The SDK reports connecting/open/reconnecting/closed; a received event also proves open.
           onStatus: (status) => dispatch({ type: "connection/changed", connection: status }),
+          // Without this the SDK ends the stream on an event type from a newer server; the
+          // snapshot picks up whatever that event changed.
+          onInvalidEvent: scheduleRefresh,
         });
         for await (const event of stream) {
           if (controller.signal.aborted) break;

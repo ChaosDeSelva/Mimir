@@ -16,9 +16,10 @@ import {
   type Task,
   type TaskInput,
 } from "@mimir/protocol";
+import { resolveCommit } from "@mimir/git";
 import type { FastifyInstance } from "fastify";
 import type { ServerContext } from "../context.js";
-import { emit } from "../emit.js";
+import { emitProjected } from "../emit.js";
 import { parseWith } from "../errors.js";
 import { idempotent } from "../idempotency.js";
 import { memberOf } from "../orchestrator/commands.js";
@@ -70,6 +71,27 @@ export function budgetFrom(
 
 const invalid = (reason: string, message: string, details: Record<string, unknown> = {}) =>
   new MimirError("validation_failed", message, { reason, ...details });
+
+/**
+ * Each base commit as the full sha it resolves to in the project's repository, without
+ * duplicates (an abbreviated and a full form of one commit are one base). 422 on one that does
+ * not resolve: such a mission could never start its root tasks.
+ */
+async function resolveBaseCommits(repoPath: string, commits: readonly string[]): Promise<string[]> {
+  const resolved: string[] = [];
+  for (const [index, commit] of commits.entries()) {
+    let sha: string;
+    try {
+      sha = await resolveCommit(repoPath, commit, "baseCommits");
+    } catch {
+      throw invalid("unknown_base_commit", `base commit ${commit} is not in the repository`, {
+        issues: [{ path: ["baseCommits", index], message: "unknown commit", code: "custom" }],
+      });
+    }
+    if (!resolved.includes(sha)) resolved.push(sha);
+  }
+  return resolved;
+}
 
 /**
  * Validates new tasks for `missionId` against the tasks it already has (unique ids, dependencies
@@ -137,7 +159,7 @@ export function createTasks(
   );
   inputs.forEach((t, i) => {
     const taskId = ids[i] as string;
-    emit(ctx.store, at, {
+    emitProjected(ctx.store, at, {
       type: "task.created",
       streamId: `task:${taskId}`,
       taskId,
@@ -200,24 +222,29 @@ export function missionRoutes(app: FastifyInstance): void {
 
   app.post(
     "/v1/missions",
-    idempotent(ctx, "mission.create", (request) => {
+    idempotent(ctx, "mission.create", async (request) => {
       const body = parseWith(CreateMissionRequestSchema, request.body);
-      if (!rm.projects.has(body.projectId)) {
+      const project = rm.projects.get(body.projectId);
+      if (!project) {
         throw invalid("unknown_project", `project ${body.projectId} not found`, {
           projectId: body.projectId,
         });
       }
+      const baseCommits = body.baseCommits
+        ? await resolveBaseCommits(project.repoPath, body.baseCommits)
+        : undefined;
       if (body.budget) checkBudgetInput(body.budget, ctx.runtimeReportsUsage);
       const at = ctx.now();
       const missionId = newId("msn");
       const taskIds = ctx.store.withTransaction(() => {
-        emit(ctx.store, at, {
+        emitProjected(ctx.store, at, {
           type: "mission.created",
           streamId: `mission:${missionId}`,
           missionId,
           payload: {
             projectId: body.projectId,
             objective: body.objective,
+            ...(baseCommits ? { baseCommits } : {}),
             ...(body.budget
               ? {
                   budget: budgetFrom(body.budget, { missionId, crewId: null }, at.toISOString()),

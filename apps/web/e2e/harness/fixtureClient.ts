@@ -206,50 +206,26 @@ export const fixtureClient: MimirClient = {
     create: async () => ({}) as never,
     start: async () => ok as never,
     cancel: async () => ok as never,
+    updateBudget: async () => ({}) as never,
   },
   crews: {
     list: async () => ({ crews: [] }),
     create: async () => ({}) as never,
-    pause: async (crewId) => {
-      const crew = (await fixtureClient.snapshot()).crews.find((item) => item.id === crewId);
-      if (!crew) throw new Error(`Unknown fixture crew: ${crewId}`);
-      return { crew: { ...crew, schedulingPaused: true }, semantics: "Scheduling paused" };
-    },
-    resume: async (crewId) => {
-      const crew = (await fixtureClient.snapshot()).crews.find((item) => item.id === crewId);
-      if (!crew) throw new Error(`Unknown fixture crew: ${crewId}`);
-      return { crew: { ...crew, schedulingPaused: false }, semantics: "Scheduling resumed" };
-    },
+    pause: async () => ({}) as never,
+    resume: async () => ({}) as never,
+    updateBudget: async () => ({}) as never,
   },
   tasks: {
-    get: async (taskId) => {
-      const snapshot = await fixtureClient.snapshot();
-      const task = snapshot.tasks.find((item) => item.id === taskId);
-      if (!task) throw new Error(`Unknown fixture task: ${taskId}`);
-      return {
-        task,
-        spec: {},
-        mission: snapshot.missions.find((item) => item.id === task.missionId) ?? null,
-        dependencies: snapshot.taskDependencies.filter((item) => item.taskId === taskId),
-        sessions: [],
-        worktrees: [],
-        artifacts: [],
-        approvals: snapshot.approvals.filter((item) => item.taskId === taskId),
-      };
-    },
-    verify: async () => ({
-      artifactId: IDS.artifact,
-      passed: false,
-      semantics: "Fixture test run: 1 of 10 tests failed",
-    }),
     list: async () => ({ tasks: [] }),
+    get: async () => ({}) as never,
     create: async () => ({}) as never,
     retry: async () => ok as never,
+    verify: async () => ({}) as never,
     requestPr: async () => ({ ...ok, status: "delivered" as const }) as never,
   },
   approvals: { list: async () => ({ approvals: [] }), decide: async () => ok as never },
   sessions: {
-    get: async () => ({ session: null, persisted: null, observedAt: T, available: false }),
+    get: async () => ({}) as never,
     input: async () => ok as never,
     stop: async () => ok as never,
     terminal: async () => ({ text: "$ pnpm test\n✓ 10 tests\n", provenance: "observed" as const }),

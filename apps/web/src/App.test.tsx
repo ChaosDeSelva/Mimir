@@ -1,4 +1,4 @@
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import { render } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
@@ -20,6 +20,28 @@ describe("App", () => {
     expect(localStorage.getItem(TOKEN_KEY)).toBeNull();
     expect(window.location.href).not.toContain("s3cret");
     expect(await screen.findByRole("heading", { level: 1, name: "Overview" })).toBeTruthy();
+  });
+
+  it("signs in for this page when the browser blocks sessionStorage", async () => {
+    const blocked = () => {
+      throw new DOMException("The operation is insecure.", "SecurityError");
+    };
+    const spies = [
+      vi.spyOn(Storage.prototype, "getItem").mockImplementation(blocked),
+      vi.spyOn(Storage.prototype, "setItem").mockImplementation(blocked),
+      vi.spyOn(Storage.prototype, "removeItem").mockImplementation(blocked),
+    ];
+    try {
+      const user = userEvent.setup();
+      const factory = vi.fn(() => mockClient());
+      render(<App clientFactory={factory} baseUrl="http://x" />);
+      await user.type(screen.getByLabelText(/auth token/i), "s3cret");
+      await user.click(screen.getByRole("button", { name: /connect/i }));
+      expect(factory).toHaveBeenCalledWith({ baseUrl: "http://x", token: "s3cret" });
+      expect(await screen.findByRole("heading", { level: 1, name: "Overview" })).toBeTruthy();
+    } finally {
+      for (const s of spies) s.mockRestore();
+    }
   });
 
   it("uses a token already in sessionStorage", async () => {
@@ -77,11 +99,46 @@ describe("App", () => {
     }
   });
 
-  it("signs out from settings", async () => {
+  it("renders the docs at a deep link with contents and search", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(TOKEN_KEY, "tok");
+    render(
+      <App
+        clientFactory={() => mockClient()}
+        baseUrl="http://x"
+        initialPath="/docs/mimir-screens"
+      />,
+    );
+    // One H1: the page title, not "Docs" plus the document's own title.
+    expect(await screen.findByRole("heading", { level: 1, name: "Mimir screens" })).toBeTruthy();
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+    const toc = screen.getAllByRole("navigation", { name: "Docs contents" })[0]!;
+    expect(
+      within(toc).getByRole("link", { name: "Mimir screens" }).getAttribute("aria-current"),
+    ).toBe("page");
+    expect(screen.getByRole("heading", { name: "Mission detail" })).toBeTruthy();
+    await user.type(screen.getByRole("searchbox", { name: "Search the docs" }), "budget");
+    expect(await screen.findByRole("heading", { name: /results?$/ })).toBeTruthy();
+    // Search finds the heading inside a page, not just the page.
+    expect(screen.getByRole("link", { name: "Budget blocked" }).getAttribute("href")).toBe(
+      "/docs/troubleshooting#budget-blocked",
+    );
+  });
+
+  it("shows a not-found page with a way back", async () => {
+    sessionStorage.setItem(TOKEN_KEY, "tok");
+    render(<App clientFactory={() => mockClient()} baseUrl="http://x" initialPath="/nope" />);
+    expect(await screen.findByRole("heading", { level: 1, name: "Not found" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Go to the overview" }).getAttribute("href")).toBe("/");
+  });
+
+  it("signs out from settings (same action as the bottom bar, no separate Forget token)", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(TOKEN_KEY, "tok");
     render(<App clientFactory={() => mockClient()} baseUrl="http://x" initialPath="/settings" />);
-    await user.click(await screen.findByRole("button", { name: "Forget token" }));
+    const settings = await screen.findByRole("region", { name: "Session" });
+    expect(screen.queryByRole("button", { name: "Forget token" })).toBeNull();
+    await user.click(within(settings).getByRole("button", { name: "Sign out" }));
     expect(screen.getByRole("heading", { name: "Connect to Mimir" })).toBeTruthy();
     expect(sessionStorage.getItem(TOKEN_KEY)).toBeNull();
   });

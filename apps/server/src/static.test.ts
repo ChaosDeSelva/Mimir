@@ -48,6 +48,19 @@ describe("web app serving", () => {
     expect(res.headers["content-type"]).toContain(type);
   });
 
+  it("refuses a path with a malformed percent-encoding instead of serving the app shell", async () => {
+    const s = serve();
+    // The router rejects it before auth or the static handler see it (their own decode guards
+    // are a second line of defence).
+    for (const headers of [{}, AUTH]) {
+      for (const url of ["/%E0%A4%A", "/%", "/%FF"]) {
+        const res = await s.app.inject({ method: "GET", url, headers });
+        expect([url, res.statusCode]).toEqual([url, 422]);
+        expect(res.body).not.toContain("<title>mimir</title>");
+      }
+    }
+  });
+
   it("marks hashed assets immutable", async () => {
     const res = await serve().app.inject({ method: "GET", url: "/assets/app.js" });
     expect(res.headers["cache-control"]).toContain("immutable");
@@ -114,9 +127,48 @@ describe("web app serving", () => {
     expect(res.statusCode).toBe(401);
   });
 
+  // Files are streamed, so the client has the whole (content-length) body before the server ends
+  // the response. A close() right then can miss the still-busy connection, which then stays open
+  // for the 72 s keep-alive timeout and hangs shutdown.
+  it("over a real socket: serves the bytes intact and close() right after does not hang", async () => {
+    const big = "x".repeat(256 * 1024);
+    writeFileSync(join(webRoot, "assets", "big.js"), big);
+    const s = serve();
+    await s.app.listen({ host: "127.0.0.1", port: 0 });
+    const { port } = s.app.server.address() as { port: number };
+    const page = await fetch(`http://127.0.0.1:${port}/missions/x`);
+    expect(await page.text()).toBe("<!doctype html><title>mimir</title>");
+    const asset = await fetch(`http://127.0.0.1:${port}/assets/big.js`);
+    expect(asset.headers.get("content-length")).toBe(String(big.length));
+    expect(await asset.text()).toBe(big);
+    await s.app.close();
+    expect(s.app.server.listening).toBe(false);
+  });
+
   it("serves nothing when no web root is configured", async () => {
     const s = makeServer();
     servers.push(s);
     expect((await s.app.inject({ method: "GET", url: "/" })).statusCode).toBe(401);
+  });
+});
+
+describe("web root checks", () => {
+  it("refuses a web root without index.html at boot", () => {
+    const empty = join(dir, "empty");
+    mkdirSync(empty);
+    expect(() => makeServer({ webRoot: empty })).toThrow(/has no index.html/);
+  });
+
+  it("serves unknown file types as octet-stream and ignores the query string", async () => {
+    writeFileSync(join(webRoot, "data.bin"), "\u0000\u0001");
+    const { app } = serve();
+    const res = await app.inject({ method: "GET", url: "/data.bin?v=3" });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toBe("application/octet-stream");
+    const route = await app.inject({ method: "GET", url: "/missions/m?tab=tasks" });
+    expect(route.body).toContain("<title>mimir</title>");
+    // An API path with a query string is still never served from the web root.
+    const api = await app.inject({ method: "GET", url: "/v1/nope?x=1", headers: AUTH });
+    expect(api.statusCode).toBe(404);
   });
 });

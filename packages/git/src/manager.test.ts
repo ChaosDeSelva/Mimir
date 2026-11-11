@@ -628,6 +628,138 @@ describe("verified task handoff", () => {
     expect(existsSync(join(repo, "backend.txt"))).toBe(false);
   });
 
+  it("combines equal inputs into the same commit, whatever their order or spelling", async () => {
+    const a = await mgr.createWorktree(input({ taskSlug: "left" }));
+    const b = await mgr.createWorktree(input({ taskSlug: "right" }));
+    await writeFile(join(a.path, "left.txt"), "left\n");
+    await writeFile(join(b.path, "right.txt"), "right\n");
+    const resultA = await mgr.checkpoint(a.id);
+    const resultB = await mgr.checkpoint(b.id);
+    const first = await mgr.dependencyBase(projectId, repo, [resultA, resultB]);
+    // Commit dates have one-second resolution: a later call must not depend on the clock.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    const second = await mgr.dependencyBase(projectId, repo, [
+      resultB,
+      resultA.slice(0, 12),
+      resultA,
+    ]);
+    expect(second).toBe(first);
+    expect(first).not.toBe(resultA);
+    expect(first).not.toBe(resultB);
+    // One commit given twice (abbreviated and full) is that commit, not a merge with itself.
+    await expect(
+      mgr.dependencyBase(projectId, repo, [resultA.slice(0, 12), resultA]),
+    ).resolves.toBe(resultA);
+  });
+
+  it("exports a rework against the default branch: the patch carries the original and the follow-up", async () => {
+    const original = sh(repo, "rev-parse", "HEAD");
+    const a = await mgr.createWorktree(input({ taskSlug: "original" }));
+    await writeFile(join(a.path, "feature.txt"), "original\n");
+    const delivered = await mgr.checkpoint(a.id);
+    const rework = await mgr.createWorktree(input({ taskSlug: "rework", baseRef: delivered }));
+    expect(rework.baseSha).toBe(delivered);
+    await writeFile(join(rework.path, "followup.txt"), "follow-up\n");
+    const reworked = await mgr.checkpoint(rework.id);
+
+    const followUpOnly = await mgr.exportResult(projectId, repo, [rework.baseSha], [reworked]);
+    expect(followUpOnly.baseSha).toBe(delivered);
+    expect(followUpOnly.patch).not.toContain("feature.txt");
+
+    const whole = await mgr.exportResult(projectId, repo, [rework.baseSha], [reworked], {
+      fromDefaultBranch: true,
+    });
+    expect(whole.baseSha).toBe(original);
+    expect(whole.followUp).toEqual({ baseSha: delivered, patch: followUpOnly.patch });
+    expect(whole.patch).toContain("feature.txt");
+    expect(whole.patch).toContain("followup.txt");
+    const patchFile = join(root, "rework.patch");
+    await writeFile(patchFile, whole.patch);
+    sh(repo, "apply", "--check", patchFile);
+  });
+
+  /** A delivered result and a rework on top of it, as `exportResult` inputs. */
+  const reworkOf = async () => {
+    const a = await mgr.createWorktree(input({ taskSlug: "original" }));
+    await writeFile(join(a.path, "feature.txt"), "original\n");
+    const delivered = await mgr.checkpoint(a.id);
+    const first = await mgr.exportResult(projectId, repo, [a.baseSha], [delivered]);
+    const rework = await mgr.createWorktree(input({ taskSlug: "rework", baseRef: delivered }));
+    await writeFile(join(rework.path, "feature.txt"), "original\nreworked\n");
+    await writeFile(join(rework.path, "followup.txt"), "follow-up\n");
+    return { first, delivered, base: rework.baseSha, result: await mgr.checkpoint(rework.id) };
+  };
+  const applies = (file: string) => {
+    try {
+      sh(repo, "apply", "--check", file);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  it("a rework export also carries the follow-up, which applies on top of an applied first delivery", async () => {
+    const original = sh(repo, "rev-parse", "HEAD");
+    const { first, delivered, base, result } = await reworkOf();
+    // The operator applies and commits the first delivery the documented way: a new commit that
+    // git does not relate to the delivered one.
+    const firstFile = join(root, "first.patch");
+    await writeFile(firstFile, first.patch);
+    sh(repo, "apply", firstFile);
+    sh(repo, "add", "-A");
+    sh(repo, "commit", "-q", "-m", "apply delivery 1");
+
+    const exported = await mgr.exportResult(projectId, repo, [base], [result], {
+      fromDefaultBranch: true,
+    });
+    expect(exported.baseSha).toBe(original);
+    expect(exported.followUp?.baseSha).toBe(delivered);
+    expect(exported.followUpOnly).toBeUndefined();
+    const whole = join(root, "whole.patch");
+    const followUp = join(root, "followup.patch");
+    await writeFile(whole, exported.patch);
+    await writeFile(followUp, exported.followUp!.patch);
+    expect(applies(whole)).toBe(false);
+    expect(applies(followUp)).toBe(true);
+    sh(repo, "apply", followUp);
+    expect(await readFile(join(repo, "feature.txt"), "utf8")).toBe("original\nreworked\n");
+    expect(await readFile(join(repo, "followup.txt"), "utf8")).toBe("follow-up\n");
+  });
+
+  it("exports the follow-up only when the default-branch base cannot be determined", async () => {
+    const { delivered, base, result } = await reworkOf();
+    const followUp = await mgr.exportResult(projectId, repo, [base], [result]);
+    // Detached HEAD and no origin/HEAD: there is no default branch.
+    sh(repo, "checkout", "-q", "--detach");
+    const detached = await mgr.exportResult(projectId, repo, [base], [result], {
+      fromDefaultBranch: true,
+    });
+    expect(detached).toMatchObject({ baseSha: delivered, patch: followUp.patch });
+    expect(detached.followUpOnly).toMatch(/default branch/);
+    expect(detached.followUp).toBeUndefined();
+    // A checked-out branch without a common ancestor.
+    sh(repo, "checkout", "-q", "--orphan", "unrelated");
+    sh(repo, "commit", "-q", "--allow-empty", "-m", "unrelated root");
+    const unrelated = await mgr.exportResult(projectId, repo, [base], [result], {
+      fromDefaultBranch: true,
+    });
+    expect(unrelated).toMatchObject({ baseSha: delivered, patch: followUp.patch });
+    expect(unrelated.followUpOnly).toMatch(/no history/);
+    expect(unrelated.followUp).toBeUndefined();
+  });
+
+  it("exports one patch when the default branch already contains what the rework started from", async () => {
+    const { delivered, base, result } = await reworkOf();
+    sh(repo, "merge", "-q", "--ff-only", delivered);
+    const exported = await mgr.exportResult(projectId, repo, [base], [result], {
+      fromDefaultBranch: true,
+    });
+    expect(exported.baseSha).toBe(delivered);
+    expect(exported.followUp).toBeUndefined();
+    expect(exported.followUpOnly).toBeUndefined();
+    expect(exported.patch).toContain("followup.txt");
+  });
+
   it("refuses conflicting or missing dependency results", async () => {
     const a = await mgr.createWorktree(input({ taskSlug: "one" }));
     const b = await mgr.createWorktree(input({ taskSlug: "two" }));

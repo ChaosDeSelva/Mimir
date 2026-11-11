@@ -8,11 +8,11 @@ const roots: string[] = [];
 afterEach(() => {
   for (const p of roots.splice(0)) rmSync(p, { recursive: true, force: true });
 });
-function worker(id: string): FleetNode {
+function worker(id: string, kind = "fixture"): FleetNode {
   const sessions = new Map<string, RuntimeSession>();
   const runtime: RuntimeAdapter = {
     capabilities: async () => ({
-      runtime: "fixture",
+      runtime: kind,
       version: "1",
       agentKinds: ["codex"],
       features: {
@@ -126,4 +126,55 @@ it("skips unhealthy nodes and incompatible harnesses", async () => {
   await expect(fleet.createSession({ ...spec("two"), agentKind: "missing" })).rejects.toThrow(
     "compatible",
   );
+});
+it("releases the capacity of sessions an in-process worker lost in a restart", async () => {
+  const root = mkdtempSync(join(tmpdir(), "mimir-fleet-"));
+  roots.push(root);
+  const file = join(root, "fleet.json");
+  const before = { ...worker("local", "cli"), capacity: 2 };
+  const fleet = new FleetRuntime([before], file);
+  await fleet.createSession(spec("one"));
+  await fleet.createSession(spec("two"));
+  await expect(fleet.createSession(spec("three"))).rejects.toMatchObject({
+    code: "runtime_unavailable",
+    details: { reason: "capacity" },
+  });
+  // The restarted server's CLI runtime starts empty: both sessions died with the old process.
+  const after = { ...worker("local", "cli"), capacity: 2 };
+  const restarted = new FleetRuntime([after], file);
+  expect((await restarted.inventory())[0]!.active).toBe(2);
+  const { sessions } = await restarted.reconcile();
+  expect(sessions.map((s) => s.state)).toEqual(["failed", "failed"]);
+  expect((await restarted.inventory())[0]!.active).toBe(0);
+  expect((await restarted.createSession(spec("three"))).state).toBe("running");
+  // A worker that could not be asked keeps its reservations.
+  vi.mocked(after.runtime.reconcile).mockRejectedValue(new Error("offline"));
+  await restarted.reconcile();
+  expect((await restarted.getSession("three"))!.state).toBe("unknown");
+});
+it("says capacity only when a compatible worker is merely busy", async () => {
+  const { fleet } = fixture();
+  await expect(fleet.createSession({ ...spec("x"), agentKind: "missing" })).rejects.toSatisfy(
+    (err: unknown) => (err as { details?: unknown }).details === undefined,
+  );
+});
+it("reports being at capacity without asking a worker, and only when that is certain", async () => {
+  const { fleet, nodes } = fixture();
+  // Kinds not known yet: the launch decides.
+  expect(fleet.atCapacity("codex")).toBe(false);
+  await fleet.capabilities();
+  expect(fleet.atCapacity("codex")).toBe(false);
+  await fleet.createSession(spec("one"));
+  expect(fleet.atCapacity("codex")).toBe(false);
+  await fleet.createSession(spec("two"));
+  const asked = nodes.map((n) => vi.mocked(n.runtime.health).mock.calls.length);
+  expect(fleet.atCapacity("codex")).toBe(true);
+  // No worker runs this kind: that is a failure for `createSession` to report, not a wait.
+  expect(fleet.atCapacity("missing")).toBe(false);
+  expect(nodes.map((n) => vi.mocked(n.runtime.health).mock.calls.length)).toEqual(asked);
+  // A draining worker is not waited for; the other one still is.
+  await fleet.setDraining("a", true);
+  expect(fleet.atCapacity("codex")).toBe(true);
+  await fleet.setDraining("b", true);
+  expect(fleet.atCapacity("codex")).toBe(false);
 });

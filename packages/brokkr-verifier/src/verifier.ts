@@ -13,6 +13,7 @@ export interface VerifierBinding {
   taskId: string;
   missionId: string;
   worktreePath: string;
+  /** The commit the worktree was created from, from Mimir's records (`git.worktree_created`). */
   baseRef: string;
   headSha: string | null;
 }
@@ -22,6 +23,11 @@ export interface BrokkrVerifyInput extends VerifierBinding {
   taskTitle?: string;
   /** `project.settings.verification`, opaque to the orchestrator. */
   verifierConfig?: unknown;
+  /**
+   * Variables laid over this process's environment before Brokkr filters it for a check (its
+   * allowlist plus the names the harness lists under `env`). PATH here is the complete value.
+   */
+  env?: Readonly<Record<string, string>>;
 }
 
 export interface VerifierCheck {
@@ -76,6 +82,9 @@ function toCheck(c: BrokkrReport["checks"][number]): VerifierCheck {
     output: `${c.state}${detail.length > 0 ? ` (${detail.join("; ")})` : ""}`,
   };
 }
+
+/** A full SHA-1 or SHA-256 commit id; anything else (a ref name, an abbreviation) is not passed. */
+const FULL_COMMIT = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 const KEY_BYTES = 32;
 
@@ -150,6 +159,10 @@ export class BrokkrVerifier {
       workspace: input.worktreePath,
       task,
       signal: input.signal,
+      // Lets Brokkr check a skipped required check's `when` guard at the base too. Never resolved
+      // inside the worktree, whose refs the agent can move; without it Brokkr says `incomplete`.
+      ...(FULL_COMMIT.test(input.baseRef) ? { baseCommit: input.baseRef } : {}),
+      ...(input.env !== undefined ? { env: { ...process.env, ...input.env } } : {}),
     });
     if (!sdk.VerificationReportSchema.safeParse(raw).success) {
       throw new MimirError("internal", "Brokkr returned a report that does not match its schema");

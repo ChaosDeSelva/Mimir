@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { newId, type ProjectId, type TaskId } from "@mimir/protocol";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -104,6 +104,8 @@ describe("gitEnv", () => {
       GIT_ATTR_NOSYSTEM: "1",
       GIT_TERMINAL_PROMPT: "0",
       GIT_INDEX_FILE: "/x",
+      GIT_NO_LAZY_FETCH: "1",
+      GIT_ALLOW_PROTOCOL: "file",
     });
     const allowed = new Set([
       "PATH",
@@ -116,6 +118,8 @@ describe("gitEnv", () => {
       "GIT_ATTR_NOSYSTEM",
       "GIT_TERMINAL_PROMPT",
       "GIT_OPTIONAL_LOCKS",
+      "GIT_NO_LAZY_FETCH",
+      "GIT_ALLOW_PROTOCOL",
       "GIT_INDEX_FILE",
     ]);
     expect(Object.keys(env).filter((k) => !allowed.has(k))).toEqual([]);
@@ -133,6 +137,8 @@ describe("C1 config audit before worktree add/remove", () => {
     ["credential.helper", "x"],
     ["core.fsmonitor", "x"],
     ["core.hooksPath", "/nonexistent/hooks"],
+    ["core.hooksPath", "../outside/hooks"],
+    ["core.hooksPath", "~/hooks"],
     ["gpg.program", "x"],
     ["alias.st", "status"],
     ["include.path", "/nonexistent/mimir-include"],
@@ -145,6 +151,17 @@ describe("C1 config audit before worktree add/remove", () => {
       details: { keys: [key.toLowerCase()] },
     });
     expect(sh(repo, "worktree", "list", "--porcelain").split("\n\n")).toHaveLength(1);
+  });
+
+  it("an in-repo core.hooksPath (husky) is tolerated and its hooks never run on createWorktree", async () => {
+    const hook = join(repo, ".husky", "post-checkout");
+    await mkdir(join(repo, ".husky"), { recursive: true });
+    await writeFile(hook, `#!/bin/sh\n'${driver}' hook\n`);
+    await chmod(hook, 0o755);
+    sh(repo, "config", "--local", "core.hooksPath", ".husky");
+    const w = await mgr.createWorktree(input());
+    expect(existsSync(w.path)).toBe(true);
+    expect(await sentinelText()).toBe("");
   });
 
   it("a smudge filter planted by an earlier task never runs on createWorktree", async () => {

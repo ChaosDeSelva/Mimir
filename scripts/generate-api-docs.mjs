@@ -24,12 +24,68 @@ const EXTRA = [
   [
     "POST",
     "/v1/tasks/{id}/pr",
-    "Request a pull request for a task. `pr.create` is gated by policy: the response is `status: approval_required` with an `approvalId` until a human approves, then `delivered`. Uses the `gh` CLI. 202 OperationAccepted.",
+    "Request a pull request for a task. `pr.create` is gated by policy: the response is `status: approval_required` with an `approvalId` until a human approves, then `delivered`. By default nothing is pushed and no pull request is opened: delivery records a `local_delivery` artifact, a git patch of the mission's verified results with its `apply` and `undo` commands (`LocalDeliveryRunner`). For a mission created with `baseCommits` (a rework) `patch` is the complete change against the default branch and `followUp: { baseSha, patch }` is the change since the earlier delivery, for a checkout that already has it applied; when no default-branch base can be determined, `patch` is that follow-up and `followUpOnly` gives the reason. The `gh` CLI is used only by a server built with `GhPrRunner`. 202 OperationAccepted.",
+  ],
+  [
+    "PATCH",
+    "/v1/projects/{id}",
+    "Replace a project's settings. Body: `{ settings }`, validated like `POST /v1/projects` (not merged with the stored settings). Needs an `Idempotency-Key`. Sessions and verifications started afterwards use the new settings. 200 `{ project }`; settings equal to the stored ones change nothing.",
   ],
   [
     "GET",
     "/v1/sessions/{id}/terminal",
     "Terminal text of a session as the runtime shows it now (query `lines`). Secrets are redacted. Display only, never a state source. `capability_unavailable` (501) when the runtime cannot read terminals.",
+  ],
+  [
+    "GET",
+    "/v1/harnesses",
+    "Interactive agent harnesses this host can launch: `{ harnesses: [{ kind, installed, version, authenticated, observationScope, lifecycleObservation, interactive, headless, experimental }] }`. Only looks executables up on `PATH` (or `MIMIR_<KIND>_BIN`); `version` is null here and `authenticated` is `not_checked`.",
+  ],
+  [
+    "GET",
+    "/v1/fleet",
+    "Workers of a fleet runtime: `{ workers }`. `capability_unavailable` when the runtime is not a fleet.",
+  ],
+  [
+    "POST",
+    "/v1/fleet/{id}/drain",
+    "Stop (`draining: true`) or resume (`false`) placing new sessions on a fleet worker. Body: `{ draining }`. 200 `{ workerId, draining }`.",
+  ],
+  ["GET", "/v1/supervisors", "Registered mission supervisors: `{ supervisors }`."],
+  [
+    "POST",
+    "/v1/supervisors",
+    "Register a supervisor. Body: `{ id, parent? }` (`id` 1-64 of `[A-Za-z0-9_-]`; `parent` a registered supervisor or null). 201 with the supervisor.",
+  ],
+  [
+    "GET",
+    "/v1/supervisors/{id}",
+    "One supervisor: `{ supervisor, policy, messages, observations }`. 404 when unknown.",
+  ],
+  [
+    "POST",
+    "/v1/supervisors/{id}/policy",
+    "Configure the supervisor's mission policy (`missionId`, `agentKind` codex or claude, `enabled`, `intervalMs`, `maxTurns`). 404 when the mission is unknown. 200 with the policy.",
+  ],
+  [
+    "POST",
+    "/v1/supervisors/{id}/state",
+    "Set the supervisor's state. Body: `{ state: ready|held|waiting_external|blocked, reason }`. 200 with the supervisor.",
+  ],
+  [
+    "POST",
+    "/v1/supervisors/{id}/messages",
+    "Queue an operator control for a session the server knows: body `{ id, control }` with `control` one of `{ kind: observe, sessionId }`, `{ kind: input, sessionId, text }`, `{ kind: stop, sessionId, mode: soft|force }`. 404 for an unknown session. 202 with the queued message.",
+  ],
+  [
+    "POST",
+    "/v1/supervisors/{id}/authorize",
+    "Approve or refuse a supervisor proposal that needs a human (input proposals). Body: `{ messageId, approved, reason }`. 200 `{ authorized }`.",
+  ],
+  [
+    "POST",
+    "/v1/supervisors/{id}/resolve",
+    "Settle a message whose outcome is uncertain. Body: `{ messageId, outcome: done|failed, reason }`. 200 `{ resolved: true }`.",
   ],
   [
     "GET",

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 
 let child: ChildProcess | undefined;
 let timer: ReturnType<typeof setTimeout> | undefined;
@@ -46,18 +47,28 @@ process.on(
       send({ kind: "timeout" });
       kill();
     }, message.timeoutMs ?? 1_200_000);
+    // One decoder per stream: a multibyte character split across chunks must not become U+FFFD.
+    const decoders = [new StringDecoder("utf8"), new StringDecoder("utf8")];
     const output = (data: Buffer, stderr: boolean) => {
       bytes += data.length;
       if (bytes > 32 * 1024 * 1024) {
         send({ kind: "limit" });
         kill();
-      } else send({ kind: "output", text: data.toString("utf8"), stderr });
+      } else send({ kind: "output", text: decoders[Number(stderr)]!.write(data), stderr });
     };
     child.stdout!.on("data", (data: Buffer) => output(data, false));
     child.stderr!.on("data", (data: Buffer) => output(data, true));
     child.on("error", () => send({ kind: "error" }));
     child.on("close", (code) => {
       clearTimeout(timer);
+      // Both streams have ended: bytes a decoder held back (output cut mid-character) are
+      // emitted (as U+FFFD), not dropped.
+      if (bytes <= 32 * 1024 * 1024) {
+        decoders.forEach((decoder, i) => {
+          const rest = decoder.end();
+          if (rest) send({ kind: "output", text: rest, stderr: i === 1 });
+        });
+      }
       // Flush queued output and the terminal event before closing IPC. Immediate disconnect
       // can discard the exit message under heavy output and misreport a lost watchdog.
       if (process.connected)

@@ -1,18 +1,29 @@
 import { execFile } from "node:child_process";
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import {
   CreateProjectRequestSchema,
   MimirError,
+  ProjectIdSchema,
+  UpdateProjectRequestSchema,
   newId,
   type CreateProjectResponse,
   type ListProjectsResponse,
   type Project,
+  type ProjectSettings,
+  type UpdateProjectResponse,
 } from "@mimir/protocol";
-import { classifyCommand, findCredentialShapes, type CredentialShape } from "@mimir/core";
+import { z } from "zod";
+import {
+  classifyCommand,
+  findCredentialShapes,
+  redactPayload,
+  type CredentialShape,
+  type PayloadRedactor,
+} from "@mimir/core";
 import type { FastifyInstance } from "fastify";
-import { emit } from "../emit.js";
+import { emitProjected } from "../emit.js";
 import { classifyOptions } from "../orchestrator/commands.js";
 import { parseWith } from "../errors.js";
 import { idempotent } from "../idempotency.js";
@@ -84,7 +95,8 @@ export async function resolveRepoPath(
 export interface CredentialField {
   /** Dotted path, e.g. `name`, `settings.nested.auth`, `settings.keys[1]`. */
   field: string;
-  kind: CredentialShape;
+  /** The credential shape, or `redacted`: the event log would store it rewritten. */
+  kind: CredentialShape | "redacted";
 }
 
 /**
@@ -118,11 +130,46 @@ export function credentialFields(name: string, settings: unknown): CredentialFie
 }
 
 /**
+ * Fields the event log's redactor would rewrite (a secret-looking key such as `NPM_TOKEN`, or
+ * text such as `password=…`) although they have no credential shape. Stored, they would be
+ * served and handed to agents as `[REDACTED:…]` instead of what the operator sent. `redactor` must
+ * be the event store's own (its `payloadRedactor`, with any extra patterns).
+ */
+export function redactedFields(
+  name: string,
+  settings: unknown,
+  redactor: PayloadRedactor = (p) => redactPayload(p),
+): CredentialField[] {
+  const out: CredentialField[] = [];
+  const diff = (value: unknown, stored: unknown, path: string) => {
+    if (typeof value === "string") {
+      if (value !== stored) out.push({ field: path, kind: "redacted" });
+    } else if (Array.isArray(value)) {
+      const s = stored as unknown[];
+      value.forEach((v, i) => diff(v, s[i], `${path}[${i}]`));
+    } else if (value !== null && typeof value === "object") {
+      const s = stored as Record<string, unknown>;
+      for (const [key, child] of Object.entries(value)) {
+        // A rewritten key is reported at its parent path, so it is never echoed.
+        if (!(key in s)) out.push({ field: path, kind: "redacted" });
+        else diff(child, s[key], `${path}.${key}`);
+      }
+    }
+  };
+  const value = JSON.parse(JSON.stringify({ name, settings })) as Record<string, unknown>;
+  const stored = redactor(value) as Record<string, unknown>;
+  diff(value["name"], stored["name"], "name");
+  diff(value["settings"], stored["settings"], "settings");
+  return out;
+}
+
+/**
  * Project name and settings are stored verbatim (the event log) and returned by the API, so
  * credentials are refused (422) rather than silently rewritten. Values are never echoed.
  */
-function assertNoCredentials(name: string, settings: unknown): void {
+function assertNoCredentials(name: string, settings: unknown, redactor: PayloadRedactor): void {
   const fields = credentialFields(name, settings);
+  if (fields.length === 0) fields.push(...redactedFields(name, settings, redactor));
   if (fields.length === 0) return;
   throw new MimirError(
     "validation_failed",
@@ -130,6 +177,31 @@ function assertNoCredentials(name: string, settings: unknown): void {
     { reason: "credential_in_project_field", fields },
   );
 }
+
+/**
+ * The test command runs in every task worktree: it must be on the project's exact allowlist
+ * (ADR-014), checked in the repository the worktrees are made from (review C2).
+ */
+function assertTestCommandAllowed(settings: ProjectSettings, repoPath: string): void {
+  const testCommand = settings.testCommand;
+  if (testCommand === undefined) return;
+  const probe = { settings } as unknown as Project;
+  const action = classifyCommand(testCommand, classifyOptions(probe, repoPath, undefined));
+  if (action === null) return;
+  throw new MimirError(
+    "validation_failed",
+    "settings.testCommand is not on the project's command allowlist",
+    {
+      reason: "test_command_not_allowlisted",
+      action,
+      issues: [
+        { path: ["settings", "testCommand"], message: `classified ${action}`, code: "custom" },
+      ],
+    },
+  );
+}
+
+const ProjectIdParamsSchema = z.object({ id: ProjectIdSchema });
 
 export function projectRoutes(app: FastifyInstance): void {
   const ctx = app.mimir;
@@ -142,32 +214,9 @@ export function projectRoutes(app: FastifyInstance): void {
     "/v1/projects",
     idempotent(ctx, "project.create", async (request) => {
       const body = parseWith(CreateProjectRequestSchema, request.body);
-      assertNoCredentials(body.name, body.settings ?? {});
+      assertNoCredentials(body.name, body.settings ?? {}, ctx.payloadRedactor);
       const repoPath = await resolveRepoPath(body.repoPath, ctx.allowedRoots);
-      // The test command runs in every task worktree: it must be on the project's exact allowlist
-      // (ADR-014), checked in the repository the worktrees are made from (review C2).
-      const testCommand = body.settings?.testCommand;
-      if (testCommand !== undefined) {
-        const probe = { settings: body.settings ?? {} } as unknown as Project;
-        const action = classifyCommand(testCommand, classifyOptions(probe, repoPath, undefined));
-        if (action !== null) {
-          throw new MimirError(
-            "validation_failed",
-            "settings.testCommand is not on the project's command allowlist",
-            {
-              reason: "test_command_not_allowlisted",
-              action,
-              issues: [
-                {
-                  path: ["settings", "testCommand"],
-                  message: `classified ${action}`,
-                  code: "custom",
-                },
-              ],
-            },
-          );
-        }
-      }
+      assertTestCommandAllowed(body.settings ?? {}, repoPath);
       if ([...ctx.readModel.projects.values()].some((p) => p.repoPath === repoPath)) {
         throw new MimirError("conflict", "a project for this repository already exists", {
           repoPath,
@@ -184,13 +233,47 @@ export function projectRoutes(app: FastifyInstance): void {
         updatedAt: now,
         version: 0,
       };
-      emit(ctx.store, at, {
+      emitProjected(ctx.store, at, {
         type: "project.created",
         streamId: `project:${project.id}`,
         payload: { project },
       });
       const response: CreateProjectResponse = { project };
       return { status: 201, body: response, target: project.id };
+    }),
+  );
+
+  /**
+   * Replaces the project's settings, validated like create. Operator configuration: sessions and
+   * verifications started afterwards use it. Settings equal to the stored ones change nothing.
+   */
+  app.patch(
+    "/v1/projects/:id",
+    idempotent(ctx, "project.update", (request) => {
+      const { id } = parseWith(ProjectIdParamsSchema, request.params);
+      const body = parseWith(UpdateProjectRequestSchema, request.body);
+      const current = ctx.readModel.projects.get(id);
+      if (!current) throw new MimirError("not_found", `project ${id} not found`, { projectId: id });
+      assertNoCredentials(current.name, body.settings, ctx.payloadRedactor);
+      assertTestCommandAllowed(body.settings, current.repoPath);
+      if (isDeepStrictEqual(current.settings, body.settings)) {
+        const same: UpdateProjectResponse = { project: current };
+        return { status: 200, body: same, target: id };
+      }
+      const at = ctx.now();
+      const project: Project = {
+        ...current,
+        settings: body.settings,
+        updatedAt: at.toISOString(),
+        version: current.version + 1,
+      };
+      emitProjected(ctx.store, at, {
+        type: "project.updated",
+        streamId: `project:${id}`,
+        payload: { project },
+      });
+      const response: UpdateProjectResponse = { project };
+      return { status: 200, body: response, target: id };
     }),
   );
 }

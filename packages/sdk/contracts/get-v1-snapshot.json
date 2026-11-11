@@ -203,6 +203,11 @@
               "minimum": 0,
               "maximum": 9007199254740991
             },
+            "cachedTokens": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
             "estimatedCost": {
               "type": "number",
               "minimum": 0
@@ -355,6 +360,13 @@
                 "cancelled",
                 "failed"
               ]
+            },
+            "baseCommits": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{7,64}$"
+              }
             }
           },
           "required": [

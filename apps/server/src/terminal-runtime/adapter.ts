@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -57,6 +57,8 @@ type Binding = {
   target?: string;
   result: string;
   delivered: boolean;
+  /** Delivery sequence; retention keeps the latest deliveries, not the latest launches. */
+  deliveredSeq?: number;
   output: string;
   stopping: boolean;
   hookFile?: string;
@@ -65,9 +67,15 @@ type Binding = {
   transcript?: TranscriptBinding;
   managedPlugin?: ManagedPlugin;
 };
+/** Delivered sessions kept in sessions.json (rewritten on every save); older ones are forgotten. */
+export const DELIVERED_SESSIONS_KEPT = 50;
+/** Idempotency keys of pruned sessions, kept so a replay is refused instead of relaunched. */
+export const FORGOTTEN_LAUNCHES_KEPT = 1000;
 const quote = (s: string) => "'" + s.replaceAll("'", "'\\''") + "'";
 export class TerminalRuntime implements RuntimeAdapter {
   private bindings = new Map<string, Binding>();
+  /** Request fingerprint by idempotency key of pruned sessions, oldest first. */
+  private forgotten = new Map<string, string>();
   private handlers = new Set<(e: RuntimeEvent) => void>();
   private timer: ReturnType<typeof setInterval> | undefined;
   private polling: Promise<void> | undefined;
@@ -81,6 +89,7 @@ export class TerminalRuntime implements RuntimeAdapter {
       const stored = JSON.parse(readFileSync(join(home, "sessions.json"), "utf8"));
       if (stored.backend !== backend.name) throw new Error("Terminal backend identity changed");
       this.bindings = new Map(stored.bindings);
+      this.forgotten = new Map(stored.forgotten ?? []);
     }
   }
   private save() {
@@ -88,7 +97,11 @@ export class TerminalRuntime implements RuntimeAdapter {
       temp = file + "." + randomUUID();
     writeFileSync(
       temp,
-      JSON.stringify({ backend: this.backend.name, bindings: [...this.bindings] }),
+      JSON.stringify({
+        backend: this.backend.name,
+        bindings: [...this.bindings],
+        forgotten: [...this.forgotten],
+      }),
       { mode: 0o600 },
     );
     renameSync(temp, file);
@@ -138,6 +151,12 @@ export class TerminalRuntime implements RuntimeAdapter {
       if (prior.fingerprint !== fingerprint)
         throw new MimirError("idempotency_replay_mismatch", "Terminal request changed");
       return { ...prior.session };
+    }
+    const forgotten = this.forgotten.get(spec.idempotencyKey);
+    if (forgotten !== undefined) {
+      if (forgotten !== fingerprint)
+        throw new MimirError("idempotency_replay_mismatch", "Terminal request changed");
+      throw new MimirError("conflict", "Terminal session already finished and was forgotten");
     }
     if (this.bindings.has(spec.sessionId))
       throw new MimirError("conflict", "Session already exists");
@@ -328,6 +347,8 @@ export class TerminalRuntime implements RuntimeAdapter {
     }));
   }
   private async observe() {
+    // Pruned a pass after delivery, so the reconcile that delivered a session still lists it.
+    this.prune();
     for (const b of this.bindings.values()) {
       if (b.delivered) continue;
       let state: RuntimeSession["state"] = "unknown";
@@ -397,6 +418,8 @@ export class TerminalRuntime implements RuntimeAdapter {
           delete b.managedPlugin;
         }
         b.delivered = true;
+        b.deliveredSeq =
+          1 + Math.max(0, ...[...this.bindings.values()].map((o) => o.deliveredSeq ?? 0));
         this.emit({
           kind: "session.exited",
           sessionId: b.session.sessionId,
@@ -421,6 +444,29 @@ export class TerminalRuntime implements RuntimeAdapter {
       this.save();
     }
   }
+  private prune() {
+    const delivered = [...this.bindings]
+      .filter(([, b]) => b.delivered)
+      .sort(([, a], [, b]) => (a.deliveredSeq ?? 0) - (b.deliveredSeq ?? 0));
+    const excess = delivered.slice(0, -DELIVERED_SESSIONS_KEPT);
+    for (const [id, b] of excess) {
+      this.bindings.delete(id);
+      this.forgotten.set(b.key, b.fingerprint);
+      // The launch file holds the prompt and environment; nothing reads these once forgotten.
+      for (const file of [
+        join(this.home, b.label + ".launch.json"),
+        b.result,
+        b.result + ".tmp",
+        ...(b.hookFile ? [b.hookFile] : []),
+      ])
+        rmSync(file, { force: true });
+    }
+    for (const key of this.forgotten.keys()) {
+      if (this.forgotten.size <= FORGOTTEN_LAUNCHES_KEPT) break;
+      this.forgotten.delete(key);
+    }
+    if (excess.length) this.save();
+  }
   async subscribe(handler: (e: RuntimeEvent) => void) {
     this.handlers.add(handler);
     if (!this.timer) {
@@ -432,6 +478,10 @@ export class TerminalRuntime implements RuntimeAdapter {
     return {
       close: () => {
         this.handlers.delete(handler);
+        if (this.handlers.size === 0 && this.timer) {
+          clearInterval(this.timer);
+          this.timer = undefined;
+        }
       },
     };
   }

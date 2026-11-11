@@ -13,6 +13,7 @@ export {
   type GitManagerOptions,
   type RegisterProjectInput,
   type CreateWorktreeInput,
+  type ExportedResult,
   type OwnerClaim,
   type RemoveWorktreeOptions,
   type RemoveWorktreeResult,
@@ -45,4 +46,4 @@ export {
   assertNoSymlinkBelow,
   MAX_SLUG_LENGTH,
 } from "./paths.js";
-export { auditRepoConfig, gitEnv, GIT_ENV_ALLOWLIST, SAFE_CONFIG } from "./git.js";
+export { auditRepoConfig, gitEnv, resolveCommit, GIT_ENV_ALLOWLIST, SAFE_CONFIG } from "./git.js";

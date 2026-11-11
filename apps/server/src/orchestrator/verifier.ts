@@ -32,6 +32,10 @@ export interface VerifyInput extends VerifyBinding {
   testCommand?: readonly string[];
   /** Opaque reference to a verification profile, passed through to Brokkr. */
   harnessRef?: string;
+  /** The project's `settings.agent` environment (see `projectEnv`); PATH is the complete value. */
+  env?: Readonly<Record<string, string>>;
+  /** The project's `settings.verificationTimeoutMs` (test command only). */
+  timeoutMs?: number;
   signal: AbortSignal;
 }
 
@@ -70,10 +74,27 @@ export interface Verifier {
   verify(input: VerifyInput): Promise<VerificationResult>;
 }
 
+/**
+ * `text` in at most `cap` characters: when it is longer, its start and its end with
+ * `[... N bytes omitted ...]` between them. Test runners print their failure summary last, so the
+ * end is what a reader (and the next attempt's brief) needs.
+ */
+export function headAndTail(text: string, cap: number): string {
+  if (text.length <= cap) return text;
+  const marker = (bytes: number) => `\n[... ${bytes} bytes omitted ...]\n`;
+  // Room for the marker with the largest count it can show.
+  const keep = Math.max(0, cap - marker(Buffer.byteLength(text)).length);
+  const head = Math.ceil(keep / 2);
+  const tail = keep - head;
+  const omitted = Buffer.byteLength(text.slice(head, text.length - tail));
+  return `${text.slice(0, head)}${marker(omitted)}${text.slice(text.length - tail)}`;
+}
+
 function capOutput(r: RunTestsResult): string {
   const text = r.stderr.length > 0 ? `${r.stdout}\n--- stderr ---\n${r.stderr}` : r.stdout;
-  if (text.length <= MAX_CHECK_OUTPUT && !r.truncated) return text;
-  return `${text.slice(0, MAX_CHECK_OUTPUT)}\n[truncated]`;
+  const kept = headAndTail(text, MAX_CHECK_OUTPUT);
+  // `runTests` stopped capturing: what came after its limit is gone.
+  return r.truncated ? `${kept}\n[truncated]` : kept;
 }
 
 /**
@@ -90,8 +111,12 @@ export class TestCommandVerifier implements Verifier {
     }
     if (input.signal.aborted) throw new MimirError("conflict", "verification was cancelled");
     const r = await runTests(input.worktreePath, [...command], {
-      timeoutMs: this.options.timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS,
+      timeoutMs: input.timeoutMs ?? this.options.timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS,
+      ...(input.env !== undefined ? { env: { ...input.env } } : {}),
+      // Cancelling the mission (or stopping the server) kills the running command.
+      signal: input.signal,
     });
+    if (input.signal.aborted) throw new MimirError("conflict", "verification was cancelled");
     const passed = r.exitCode === 0 && !r.timedOut;
     return {
       source: "test-command",

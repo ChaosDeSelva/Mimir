@@ -76,6 +76,24 @@ describe("layerTasks", () => {
 });
 
 describe("deriveAttention", () => {
+  it("keeps a server attention kind it does not know, after the kinds it does", () => {
+    const pending = approval({ action: "runtime.force_stop" });
+    let s = reducer(initialState, {
+      type: "snapshot/loaded",
+      snapshot: snapshot({ approvals: [pending] }),
+    });
+    s = reducer(s, {
+      type: "attention/loaded",
+      items: [
+        { id: "srv-new", kind: "drift", title: "From a newer server" },
+        { id: "srv-budget", kind: "budget", title: "Budget warning" },
+      ] as never,
+    });
+    const kinds = deriveAttention(s, NOW).map((i) => i.kind as string);
+    expect(kinds).toContain("drift");
+    expect(kinds.indexOf("drift")).toBeGreaterThan(kinds.indexOf("budget"));
+  });
+
   it("lists pending approvals first, then blocked, stuck and budget items", () => {
     const m = mission();
     const blocked = task({
@@ -112,7 +130,7 @@ describe("deriveAttention", () => {
     const items = deriveAttention(s, NOW);
     expect(items.map((i) => i.kind)).toEqual(["approval", "blocked", "stuck", "budget"]);
     expect(items[0]?.approvalId).toBe(pending.id);
-    expect(items[1]?.detail).toContain("unknown_after_restart");
+    expect(items[1]?.detail).toBe("Reason: Session lost in a restart");
     expect(items[2]?.taskId).toBe(stuck.id);
   });
 

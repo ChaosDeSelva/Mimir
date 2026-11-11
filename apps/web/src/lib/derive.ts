@@ -2,6 +2,8 @@
 import type { EventEnvelope, Provenance, Task, TaskDependency, TaskStatus } from "@mimir/protocol";
 import type { AttentionItem } from "../api/client.js";
 import type { State } from "../store/reducer.js";
+import { describeBlockedReason } from "./blockedReason.js";
+import { taskName } from "./names.js";
 
 export interface Progress {
   completed: number;
@@ -80,6 +82,22 @@ const KIND_ORDER: Record<AttentionItem["kind"], number> = {
 };
 
 /**
+ * The server list is only as new as the last snapshot load; events folded since may have settled
+ * what an item is about (an approval decided, a task no longer blocked).
+ */
+function resolvedSince(item: AttentionItem, state: State): boolean {
+  if (item.kind === "approval" && item.approvalId !== undefined) {
+    const a = state.approvals.find((x) => x.id === item.approvalId);
+    return a !== undefined && a.status !== "pending";
+  }
+  if (item.kind === "blocked" && item.taskId !== undefined) {
+    const t = state.tasks.find((x) => x.id === item.taskId);
+    return t !== undefined && t.status !== "blocked";
+  }
+  return false;
+}
+
+/**
  * Notes: budget alerts last for this page session (no "restored" event exists in protocol v1), and
  * "stuck" compares `leaseExpiresAt` with the browser clock; server `/v1/attention` items (T12) are
  * authoritative when present.
@@ -107,8 +125,8 @@ export function deriveAttention(state: State, now: number): AttentionItem[] {
       items.push({
         id: `blocked:${t.id}`,
         kind: "blocked",
-        title: `Blocked: ${t.title}`,
-        detail: `Reason: ${t.blockedReason ?? "not reported"}`,
+        title: `Blocked: ${taskName(t)}`,
+        detail: `Reason: ${t.blockedReason ? describeBlockedReason(t.blockedReason).words : "not reported"}`,
         missionId: t.missionId,
         taskId: t.id,
       });
@@ -120,7 +138,7 @@ export function deriveAttention(state: State, now: number): AttentionItem[] {
       items.push({
         id: `stuck:${t.id}`,
         kind: "stuck",
-        title: `Stuck: ${t.title}`,
+        title: `Stuck: ${taskName(t)}`,
         detail: `Lease expired at ${t.leaseExpiresAt}`,
         missionId: t.missionId,
         taskId: t.id,
@@ -152,11 +170,13 @@ export function deriveAttention(state: State, now: number): AttentionItem[] {
     `${i.kind}:${i.approvalId ?? i.taskId ?? i.sessionId ?? i.missionId ?? i.id}`;
   const seen = new Set([...items.map((i) => i.id), ...items.map(entityKey)]);
   for (const s of state.serverAttention) {
-    if (seen.has(s.id) || seen.has(entityKey(s))) continue;
+    if (seen.has(s.id) || seen.has(entityKey(s)) || resolvedSince(s, state)) continue;
     seen.add(s.id).add(entityKey(s));
     items.push(s);
   }
-  return items.sort((x, y) => KIND_ORDER[x.kind] - KIND_ORDER[y.kind]);
+  // A newer server can send a kind this build does not know: sort it with the unknowns, last.
+  const rank = (i: AttentionItem) => KIND_ORDER[i.kind] ?? KIND_ORDER.unknown;
+  return items.sort((x, y) => rank(x) - rank(y));
 }
 
 export interface EventFilter {

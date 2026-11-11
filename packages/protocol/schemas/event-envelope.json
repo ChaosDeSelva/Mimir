@@ -74,12 +74,14 @@
         "mission.failed",
         "session.input",
         "project.created",
+        "project.updated",
         "crew.created",
         "crew.scheduling_changed",
         "usage.recorded",
         "approval.consumed",
         "artifact.collection_skipped",
-        "artifact.collection_truncated"
+        "artifact.collection_truncated",
+        "budget.updated"
       ]
     },
     "source": {

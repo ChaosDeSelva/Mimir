@@ -114,6 +114,14 @@ describe("requestStop", () => {
     clock.advance(5000);
     expect(events).toHaveLength(n);
   });
+
+  it("on an unknown session throws not_found and emits nothing", async () => {
+    const { fake, events } = await setup();
+    for (const mode of ["soft", "force"] as const) {
+      await expect(fake.requestStop("nope", mode)).rejects.toMatchObject({ code: "not_found" });
+    }
+    expect(events).toEqual([]);
+  });
 });
 
 describe("chaos", () => {
@@ -189,5 +197,48 @@ describe("readTerminal (capabilities advertise terminalRead)", () => {
     await expect(fake.readTerminal("ses_01J00000000000000000000099")).rejects.toMatchObject({
       code: "not_found",
     });
+  });
+});
+
+describe("lifecycle edges", () => {
+  it("works with its own clock and default script, and reports healthy", async () => {
+    const fake = new FakeRuntime();
+    expect(await fake.health()).toEqual({ ok: true });
+    await fake.createSession(spec());
+    fake.clock.advance(1000);
+    expect((await fake.getSession("ses_1"))?.state).toBe("completed");
+    expect(await fake.getSession("ses_nope")).toBeNull();
+  });
+
+  it("dispose cancels pending script steps and drops subscribers", async () => {
+    const { clock, fake, events } = await setup();
+    await fake.createSession(spec());
+    await fake.dispose();
+    clock.advance(1000);
+    expect(events).toEqual([]);
+    expect((await fake.getSession("ses_1"))?.state).toBe("starting");
+  });
+
+  it("sendInput unblocks a blocked session; other states are left alone", async () => {
+    const { clock, fake } = await setup([{ afterMs: 10, state: "blocked" }]);
+    await fake.createSession(spec());
+    await fake.sendInput("ses_1", { keys: ["Enter"] });
+    expect((await fake.getSession("ses_1"))?.state).toBe("starting");
+    clock.advance(10);
+    await fake.sendInput("ses_1", { keys: ["Enter"] });
+    expect((await fake.getSession("ses_1"))?.state).toBe("running");
+    expect(fake.inputs["ses_1"]).toEqual([{ keys: ["Enter"] }, { keys: ["Enter"] }]);
+    expect(await fake.readTerminal("ses_1")).toBe("");
+  });
+
+  it("a lost session runs no further steps, cannot be read, and loseSession needs a known id", async () => {
+    const { clock, fake, events } = await setup([{ afterMs: 10, output: "late" }]);
+    await fake.createSession(spec());
+    fake.loseSession("ses_1");
+    clock.advance(10);
+    expect(events.map((e) => e.kind)).toEqual(["session.lost"]);
+    expect(await fake.getSession("ses_1")).toBeNull();
+    await expect(fake.readTerminal("ses_1")).rejects.toMatchObject({ code: "not_found" });
+    expect(() => fake.loseSession("ses_nope")).toThrow(/unknown session/);
   });
 });

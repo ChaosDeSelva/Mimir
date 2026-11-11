@@ -19,12 +19,28 @@ export type FleetNode = {
 };
 type Placement = { node: string; key: string; fingerprint: string; session: RuntimeSession };
 type NodeState = { identity: string; draining: boolean };
+/** `details.reason` of a `runtime_unavailable` that only means "no free slot right now". */
+export const RUNTIME_AT_CAPACITY = "capacity";
+/** A runtime that can tell, without asking a worker, that a launch would only find it full. */
+export interface CapacityAware {
+  /** True only when a compatible worker exists and every one of them is busy right now. */
+  atCapacity(agentKind: string): boolean;
+}
+export const isCapacityAware = (runtime: object): runtime is CapacityAware =>
+  typeof (runtime as Partial<CapacityAware>).atCapacity === "function";
 const terminal = new Set(["completed", "failed", "stopped", "lost"]);
+/**
+ * Node runtimes whose sessions live only in this process (`CliRuntime`: a worker dies with the
+ * server). A session such a node no longer reports cannot come back, so it has ended.
+ */
+const IN_PROCESS_RUNTIMES = new Set(["cli", "tmux"]);
 /** One controller (protected by Mimir's store lock), durable placement before dispatch.
  * An uncertain dispatch reserves capacity until the SAME worker confirms its outcome.
  */
-export class FleetRuntime implements RuntimeAdapter {
+export class FleetRuntime implements RuntimeAdapter, CapacityAware {
   private placements = new Map<string, Placement>();
+  /** Agent kinds each worker last reported (`atCapacity` answers from these, without a call). */
+  private kinds = new Map<string, readonly string[]>();
   private states = new Map<string, NodeState>();
   private listeners = new Set<(event: RuntimeEvent) => void>();
   private subscriptions: { close(): void }[] = [];
@@ -96,11 +112,46 @@ export class FleetRuntime implements RuntimeAdapter {
             for (const handler of this.listeners) handler(event);
           }),
         );
-    })();
+    })().catch((error: unknown) => {
+      // A failed connect must not stay memoized: close partial subscriptions and retry next call.
+      for (const sub of this.subscriptions.splice(0)) sub.close();
+      this.ready = undefined;
+      throw error;
+    });
     await this.ready;
   }
+  private async capabilitiesOf(node: FleetNode): Promise<RuntimeCapabilities> {
+    const caps = await node.runtime.capabilities();
+    this.kinds.set(node.id, caps.agentKinds);
+    return caps;
+  }
+  private activeOn(node: FleetNode): number {
+    return [...this.placements.values()].filter(
+      (p) => p.node === node.id && !terminal.has(p.session.state),
+    ).length;
+  }
+  /**
+   * The answer `createSession` would give as `RUNTIME_AT_CAPACITY`, from placements and the kinds
+   * the workers last reported. False whenever that is not certain (a free slot, or a full worker
+   * whose kinds are not known yet): the launch then decides.
+   */
+  atCapacity(agentKind: string): boolean {
+    let full = false;
+    for (const node of this.nodes) {
+      if (
+        this.states.get(node.id)!.draining ||
+        (node.agentKinds && !node.agentKinds.includes(agentKind))
+      )
+        continue;
+      const kinds = this.kinds.get(node.id);
+      if (this.activeOn(node) < node.capacity) {
+        if (kinds === undefined || kinds.includes(agentKind)) return false;
+      } else if (kinds?.includes(agentKind)) full = true;
+    }
+    return full;
+  }
   async capabilities(): Promise<RuntimeCapabilities> {
-    const caps = await Promise.all(this.nodes.map((n) => n.runtime.capabilities()));
+    const caps = await Promise.all(this.nodes.map((n) => this.capabilitiesOf(n)));
     return {
       runtime: "fleet",
       version: "1",
@@ -187,19 +238,23 @@ export class FleetRuntime implements RuntimeAdapter {
       if (this.placements.has(spec.sessionId))
         throw new MimirError("conflict", "Fleet session ID already exists");
       const eligible: { node: FleetNode; load: number }[] = [];
+      let full = false;
       for (const node of this.nodes) {
         if (
           this.states.get(node.id)!.draining ||
           (node.agentKinds && !node.agentKinds.includes(spec.agentKind))
         )
           continue;
-        const active = [...this.placements.values()].filter(
-          (p) => p.node === node.id && !terminal.has(p.session.state),
-        ).length;
-        if (active >= node.capacity) continue;
+        const active = this.activeOn(node);
+        if (active >= node.capacity) {
+          full ||= await this.capabilitiesOf(node)
+            .then((c) => c.agentKinds.includes(spec.agentKind))
+            .catch(() => false);
+          continue;
+        }
         try {
           if (
-            (await node.runtime.capabilities()).agentKinds.includes(spec.agentKind) &&
+            (await this.capabilitiesOf(node)).agentKinds.includes(spec.agentKind) &&
             (await node.runtime.health()).ok
           )
             eligible.push({ node, load: active / node.capacity });
@@ -213,6 +268,8 @@ export class FleetRuntime implements RuntimeAdapter {
         throw new MimirError(
           "runtime_unavailable",
           "No reachable, compatible fleet worker has capacity",
+          // A compatible worker exists but is busy: the launch can wait instead of failing.
+          full ? { reason: RUNTIME_AT_CAPACITY } : undefined,
         );
       const placement: Placement = {
         node: node.id,
@@ -281,8 +338,10 @@ export class FleetRuntime implements RuntimeAdapter {
     return this.serial(async () => {
       for (const node of this.nodes) {
         let observed: RuntimeSession[] = [];
+        let inProcess = false;
         try {
           observed = (await node.runtime.reconcile()).sessions;
+          inProcess = IN_PROCESS_RUNTIMES.has((await node.runtime.capabilities()).runtime);
         } catch {
           /* Preserve the owner and reservation. */
         }
@@ -290,7 +349,8 @@ export class FleetRuntime implements RuntimeAdapter {
           if (p.node !== node.id || terminal.has(p.session.state)) continue;
           const session = observed.find((s) => s.sessionId === p.session.sessionId);
           if (session) p.session = session;
-          else p.session = { ...p.session, state: "unknown" }; // Missing is not proof of termination.
+          // Elsewhere missing is not proof of termination: the reservation is kept.
+          else p.session = { ...p.session, state: inProcess ? "failed" : "unknown" };
         }
       }
       this.save();

@@ -22,6 +22,26 @@ export function projectSettings(project: Project | undefined): ProjectSettings {
   return parsed.success ? parsed.data : {};
 }
 
+/**
+ * The project's `settings.agent` environment for a process started on this host: its extra
+ * variables, and PATH with the project's directories in front of `basePath`. Undefined when the
+ * project sets none.
+ */
+export function projectEnv(
+  project: Project | undefined,
+  basePath: string | undefined = process.env["PATH"],
+): Record<string, string> | undefined {
+  const agent = projectSettings(project).agent;
+  const prepend = agent?.pathPrepend ?? [];
+  const env = {
+    ...agent?.env,
+    ...(prepend.length > 0
+      ? { PATH: [...prepend, ...(basePath ? [basePath] : [])].join(":") }
+      : {}),
+  };
+  return Object.keys(env).length > 0 ? env : undefined;
+}
+
 /** Project entries extend the defaults; validated test argv is allowed exactly. */
 export function allowlistOf(project: Project | undefined): readonly AllowlistEntry[] {
   const settings = projectSettings(project);
@@ -69,7 +89,8 @@ const PLAIN_WORDS = /^[A-Za-z0-9_./:=@%+,-]+(?: [A-Za-z0-9_./:=@%+,-]+)*$/;
 
 /**
  * What the policy gate classifies for a session's argv:
- * - explicit task argv: exec argv for shell members; non-template agent flags need approval;
+ * - explicit task argv: exec argv for shell members; agent flags need approval (the caller
+ *   passes `explicit: false` for argv equal to the agent kind's plain template);
  * - a `shell` member's `sh -c <cmd>`: the words of `cmd` when it is plain words (no quoting,
  *   expansion, redirection or separators, so `sh` runs exactly that argv), else the full
  *   `sh -c` argv (which the exact allowlist never matches, so it needs approval);
@@ -80,10 +101,8 @@ export function classifiedArgv(
   argv: readonly string[],
   explicit: boolean,
   agentKind: string,
-  template?: readonly string[],
 ): string[] | null {
   if (explicit && agentKind !== "shell") {
-    if (template && JSON.stringify(argv) === JSON.stringify(template)) return null;
     // Empty command heads can never be allowlisted. Agent arguments are not exec argv.
     return ["", ...argv];
   }

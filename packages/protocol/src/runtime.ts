@@ -48,6 +48,8 @@ export interface RuntimeSessionSpec {
   timeoutMs?: number;
   cwd: string;
   env: Record<string, string>;
+  /** See `RuntimeSessionSpecSchema.agentEnv`. */
+  agentEnv?: { env?: Record<string, string>; pathPrepend?: string[] };
   workspaceLabel: string;
 }
 
@@ -80,7 +82,12 @@ export type RuntimeEvent =
       sessionId: string;
       exitCode?: number;
       observedAt: string;
-      usage?: { tokens: number; estimatedCost: number | null };
+      /**
+       * `tokens` is what the session consumed against a token budget: fresh input (cache writes
+       * included) plus output. `cachedTokens` is input served from the provider's prompt cache,
+       * reported separately and never counted against a budget.
+       */
+      usage?: { tokens: number; estimatedCost: number | null; cachedTokens?: number };
     }
   | { kind: "session.lost"; sessionId: string; reason: string; observedAt: string }
   | { kind: "runtime.gap"; reason: "events_lost" | "reconnect" | "restart"; observedAt: string };
@@ -133,6 +140,16 @@ export const RuntimeSessionSpecSchema = z.object({
   timeoutMs: z.number().int().positive().exactOptional(),
   cwd: z.string().min(1),
   env: z.record(z.string(), z.string()),
+  /**
+   * The project's `settings.agent` environment. Applied by runtimes that launch on this host
+   * (`cli`, `tmux`); the others ignore it.
+   */
+  agentEnv: z
+    .object({
+      env: z.record(z.string(), z.string()).exactOptional(),
+      pathPrepend: z.array(z.string()).exactOptional(),
+    })
+    .exactOptional(),
   workspaceLabel: z.string(),
 });
 
@@ -168,6 +185,7 @@ export const RuntimeEventSchema = z.discriminatedUnion("kind", [
       .object({
         tokens: z.number().nonnegative(),
         estimatedCost: z.number().nonnegative().nullable(),
+        cachedTokens: z.number().int().nonnegative().exactOptional(),
       })
       .exactOptional(),
     observedAt: TimestampSchema,

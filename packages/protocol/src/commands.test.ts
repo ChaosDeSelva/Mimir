@@ -22,6 +22,7 @@ import {
   StartMissionRequestSchema,
   StopSessionRequestSchema,
   UsageQuerySchema,
+  UpdateProjectRequestSchema,
   UsageResponseSchema,
   type ListEventsQuery,
   type ListEventsQueryInput,
@@ -199,6 +200,38 @@ describe("mutation requests", () => {
     expect(ProjectSettingsSchema.parse({})).toEqual({});
   });
 
+  it("ProjectSettings.agent: bounded env, absolute PATH entries and Codex sandbox additions", () => {
+    const agent = {
+      env: { GOCACHE: "/var/cache/go-build", GOFLAGS: "-mod=mod" },
+      pathPrepend: ["/Users/dev/.local/share/mise/shims"],
+      codexSandbox: { writableRoots: ["/var/cache/go-build"], networkAccess: true },
+    };
+    expect(ProjectSettingsSchema.parse({ agent, verificationTimeoutMs: 1_800_000 })).toEqual({
+      agent,
+      verificationTimeoutMs: 1_800_000,
+    });
+    expect(ProjectSettingsSchema.parse({ agent: {} })).toEqual({ agent: {} });
+    const ok = (settings: unknown) => ProjectSettingsSchema.safeParse(settings).success;
+    for (const name of ["PATH", "HOME", "NODE_OPTIONS", "GIT_DIR", "LD_PRELOAD", "DYLD_X", "1A"]) {
+      expect(ok({ agent: { env: { [name]: "x" } } }), name).toBe(false);
+    }
+    expect(ok({ agent: { env: { A: "x\0y" } } })).toBe(false);
+    expect(ok({ agent: { env: { A: "x".repeat(4097) } } })).toBe(false);
+    expect(
+      ok({ agent: { env: Object.fromEntries([...Array(65).keys()].map((i) => [`V${i}`, ""])) } }),
+    ).toBe(false);
+    expect(ok({ agent: { pathPrepend: ["bin"] } })).toBe(false);
+    expect(ok({ agent: { pathPrepend: ["/a:/b"] } })).toBe(false);
+    expect(ok({ agent: { pathPrepend: ["/a/../b"] } })).toBe(false);
+    expect(ok({ agent: { codexSandbox: { writableRoots: ["~/cache"] } } })).toBe(false);
+    expect(ok({ agent: { codexSandbox: { network: true } } })).toBe(false);
+    expect(ok({ agent: { unknown: 1 } })).toBe(false);
+    expect(ok({ verificationTimeoutMs: 0 })).toBe(false);
+    expect(UpdateProjectRequestSchema.safeParse({ settings: { agent } }).success).toBe(true);
+    expect(UpdateProjectRequestSchema.safeParse({}).success).toBe(false);
+    expect(UpdateProjectRequestSchema.safeParse({ settings: {}, name: "x" }).success).toBe(false);
+  });
+
   it("ProjectSettings.verification is an opaque verifier configuration object (T12b)", () => {
     const verification = { harnesses: ["documentation@^1"], lockPath: "/x/lock.json" };
     expect(ProjectSettingsSchema.parse({ verification })).toEqual({ verification });
@@ -287,6 +320,7 @@ describe("mutation requests", () => {
     expect(UsageQuerySchema.parse(q)).toEqual(q);
     const totals = {
       tokens: 0,
+      cachedTokens: 0,
       estimatedCost: 0,
       samples: 1,
       bySource: { measured: 0, estimated: 0, unavailable: 1 },
@@ -384,6 +418,7 @@ describe("read models", () => {
       worktrees: [],
       usage: {
         tokens: 0,
+        cachedTokens: 0,
         estimatedCost: 0,
         samples: 0,
         bySource: { measured: 0, estimated: 0, unavailable: 0 },

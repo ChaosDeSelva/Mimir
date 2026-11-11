@@ -143,7 +143,8 @@ describe("reducer: events", () => {
       ),
     });
     expect(s.tasks[0]?.status).toBe("leased");
-    expect(s.tasks[0]?.attempt).toBe(1);
+    // The payload's attempt number is 1-based; Task.attempt is the 0-based index.
+    expect(s.tasks[0]?.attempt).toBe(0);
     expect(s.tasks[0]?.agentId).toBe(agentId);
     expect(s.tasks[0]?.leaseExpiresAt).toBe("2026-10-14T11:00:00.000Z");
   });
@@ -273,6 +274,23 @@ describe("reducer: events", () => {
       event: event("budget.exceeded", { budgetId, unit: "tokens", used: 101, limit: 100 }),
     });
     expect(s.budgetAlerts[budgetId]?.level).toBe("exceeded");
+    const at = "2026-01-01T00:00:00.000Z";
+    const budget = {
+      id: budgetId,
+      missionId: m,
+      crewId: null,
+      limitTokens: 1000,
+      limitCost: null,
+      warnAtFraction: 0.8,
+      createdAt: at,
+      updatedAt: at,
+      version: 1,
+    };
+    s = reducer(s, {
+      type: "event/received",
+      event: event("budget.updated", { budget, previous: { ...budget, limitTokens: 100 } }),
+    });
+    expect(s.budgetAlerts[budgetId]).toBeUndefined();
   });
 });
 
@@ -309,6 +327,38 @@ describe("reducer: connection and gaps", () => {
       items: [{ id: "x", kind: "stuck", title: "stuck" }],
     });
     expect(s.serverAttention).toHaveLength(1);
+  });
+});
+
+describe("reducer: statuses from a newer server", () => {
+  it("keeps a task in a status the board knows when an event names an unknown one", () => {
+    const t = task({ status: "running" });
+    const e = event(
+      "task.blocked",
+      { from: "running", to: "on_hold" as never, reason: "x" },
+      {
+        taskId: t.id,
+      },
+    );
+    const s = reducer(loaded({ tasks: [t] }), { type: "event/received", event: e });
+    expect(s.tasks[0]!.status).toBe("running");
+    expect(s.events).toHaveLength(1);
+    // The snapshot is reloaded instead, so whatever the server holds now shows.
+    expect(needsSnapshotRefresh(e)).toBe(true);
+  });
+
+  it("keeps a mission's status when an event names an unknown one", () => {
+    const m = mission({ status: "active" });
+    const e = event(
+      "mission.paused",
+      { from: "active", to: "archived" as never },
+      {
+        missionId: m.id,
+      },
+    );
+    const s = reducer(loaded({ missions: [m] }), { type: "event/received", event: e });
+    expect(s.missions[0]!.status).toBe("active");
+    expect(needsSnapshotRefresh(e)).toBe(true);
   });
 });
 

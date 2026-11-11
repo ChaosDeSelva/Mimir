@@ -2,6 +2,8 @@ import {
   CrewSchedulingRequestSchema,
   CrewSchedulingResponseSchema,
   SessionObservationResponseSchema,
+  UpdateBudgetRequestSchema,
+  UpdateBudgetResponseSchema,
   VerifyTaskResponseSchema,
 } from "./commands.js";
 import {
@@ -10,6 +12,7 @@ import {
   type RouteConfig,
 } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
+import { withExactOptionalKeys } from "./openapi-required.js";
 import {
   ApprovalDecisionRequestSchema,
   ApprovalIdParamsSchema,
@@ -58,6 +61,7 @@ import {
   AgentSchema,
   ApprovalSchema,
   ArtifactSchema,
+  BudgetPolicySchema,
   CrewMemberSchema,
   CrewSchema,
   MissionSchema,
@@ -212,6 +216,15 @@ const ENDPOINTS: Endpoint[] = [
     body: CrewSchedulingRequestSchema,
     status: 200 as const,
     response: CrewSchedulingResponseSchema,
+  })),
+  ...(["crews", "missions"] as const).map((scope) => ({
+    method: "patch" as const,
+    path: `/v1/${scope}/{id}/budget`,
+    summary: `Raise, lower or replace the ${scope === "crews" ? "crew" : "mission"}'s budget limits (tasks blocked only by it resume on the next tick)`,
+    params: z.object({ id: z.string().min(1) }),
+    body: UpdateBudgetRequestSchema,
+    status: 200 as const,
+    response: UpdateBudgetResponseSchema,
   })),
   {
     method: "get",
@@ -379,6 +392,7 @@ export const OPENAPI_COMPONENTS: Record<string, z.ZodType> = {
   Artifact: ArtifactSchema,
   Approval: ApprovalSchema,
   UsageSample: UsageSampleSchema,
+  BudgetPolicy: BudgetPolicySchema,
   EventEnvelope: EventEnvelopeSchema,
   RuntimeCapabilities: RuntimeCapabilitiesSchema,
   OperationAccepted: OperationAcceptedSchema,
@@ -393,7 +407,8 @@ export function generateOpenApi(): OpenApiDocument {
     const request: NonNullable<RouteConfig["request"]> = {};
     if (e.params) request.params = e.params;
     if (e.query) request.query = e.query;
-    if (e.method === "post") request.headers = IdempotencyHeadersSchema;
+    // The server refuses every mutation (POST, PATCH, ...) without the header.
+    if (e.method !== "get") request.headers = IdempotencyHeadersSchema;
     if (e.body) {
       // Bodies whose fields are all optional (start/cancel/retry) may be omitted.
       const required = !e.body.safeParse({}).success;
@@ -422,16 +437,22 @@ export function generateOpenApi(): OpenApiDocument {
     });
   }
 
-  return new OpenApiGeneratorV31(registry.definitions).generateDocument({
-    openapi: "3.1.0",
-    info: {
-      title: "Mimir API",
-      version: PROTOCOL_PACKAGE_VERSION,
-      description:
-        "Local-first mission control for crews of coding agents. Mutations require the `idempotency-key` header; asynchronous mutations return 202 with an OperationAccepted body.",
-    },
-    servers: [{ url: "http://127.0.0.1:7700" }],
-  });
+  const roots = [
+    ...ENDPOINTS.flatMap((e) => [e.params, e.query, e.body, e.response]),
+    ...Object.values(OPENAPI_COMPONENTS),
+  ];
+  return withExactOptionalKeys(roots, () =>
+    new OpenApiGeneratorV31(registry.definitions).generateDocument({
+      openapi: "3.1.0",
+      info: {
+        title: "Mimir API",
+        version: PROTOCOL_PACKAGE_VERSION,
+        description:
+          "Local-first mission control for crews of coding agents. Mutations require the `idempotency-key` header; asynchronous mutations return 202 with an OperationAccepted body.",
+      },
+      servers: [{ url: "http://127.0.0.1:7700" }],
+    }),
+  );
 }
 
 /** JSON Schema (draft 2020-12) for the event envelope. Pure; no I/O. */

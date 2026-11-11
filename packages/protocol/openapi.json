@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Mimir API",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "description": "Local-first mission control for crews of coding agents. Mutations require the `idempotency-key` header; asynchronous mutations return 202 with an OperationAccepted body."
   },
   "servers": [
@@ -205,6 +205,13 @@
               "cancelled",
               "failed"
             ]
+          },
+          "baseCommits": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{7,64}$"
+            }
           }
         },
         "required": [
@@ -726,6 +733,85 @@
           "name"
         ]
       },
+      "BudgetPolicy": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^bgt_[0-9A-HJKMNP-TV-Z]{26}$"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "missionId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^msn_[0-9A-HJKMNP-TV-Z]{26}$"
+          },
+          "crewId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^crw_[0-9A-HJKMNP-TV-Z]{26}$"
+          },
+          "limitTokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "limitCost": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "warnAtFraction": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "enforce": {
+            "type": "string",
+            "enum": [
+              "hard",
+              "soft"
+            ]
+          },
+          "onUnknown": {
+            "type": "string",
+            "enum": [
+              "allow",
+              "block"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "createdAt",
+          "updatedAt",
+          "version",
+          "missionId",
+          "crewId",
+          "limitTokens",
+          "limitCost",
+          "warnAtFraction"
+        ]
+      },
       "Artifact": {
         "type": "object",
         "properties": {
@@ -847,12 +933,14 @@
               "mission.failed",
               "session.input",
               "project.created",
+              "project.updated",
               "crew.created",
               "crew.scheduling_changed",
               "usage.recorded",
               "approval.consumed",
               "artifact.collection_skipped",
-              "artifact.collection_truncated"
+              "artifact.collection_truncated",
+              "budget.updated"
             ]
           },
           "source": {
@@ -931,6 +1019,10 @@
               "integer",
               "null"
             ],
+            "minimum": 0
+          },
+          "cachedTokens": {
+            "type": "integer",
             "minimum": 0
           },
           "estimatedCost": {
@@ -1145,6 +1237,10 @@
                       "type": "object",
                       "properties": {
                         "tokens": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "cachedTokens": {
                           "type": "integer",
                           "minimum": 0
                         },
@@ -1369,6 +1465,49 @@
                         "type": "integer",
                         "exclusiveMinimum": 0,
                         "maximum": 86400000
+                      },
+                      "agent": {
+                        "type": "object",
+                        "properties": {
+                          "env": {
+                            "type": "object",
+                            "additionalProperties": {
+                              "type": "string",
+                              "maxLength": 4096
+                            }
+                          },
+                          "pathPrepend": {
+                            "type": "array",
+                            "items": {
+                              "type": "string",
+                              "maxLength": 1024
+                            },
+                            "maxItems": 32
+                          },
+                          "codexSandbox": {
+                            "type": "object",
+                            "properties": {
+                              "writableRoots": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string",
+                                  "maxLength": 1024
+                                },
+                                "maxItems": 32
+                              },
+                              "networkAccess": {
+                                "type": "boolean"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "additionalProperties": false
+                      },
+                      "verificationTimeoutMs": {
+                        "type": "integer",
+                        "minimum": 1000,
+                        "maximum": 86400000
                       }
                     },
                     "additionalProperties": {}
@@ -1514,6 +1653,15 @@
                       }
                     },
                     "additionalProperties": false
+                  },
+                  "baseCommits": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{7,64}$"
+                    },
+                    "minItems": 1,
+                    "maxItems": 16
                   },
                   "tasks": {
                     "type": "array",
@@ -2255,6 +2403,232 @@
         }
       }
     },
+    "/v1/crews/{id}/budget": {
+      "patch": {
+        "summary": "Raise, lower or replace the crew's budget limits (tasks blocked only by it resume on the next tick)",
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Unique key per logical mutation; replays return the original result."
+            },
+            "required": true,
+            "description": "Unique key per logical mutation; replays return the original result.",
+            "name": "idempotency-key",
+            "in": "header"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "limitTokens": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "exclusiveMinimum": 0,
+                    "maximum": 10000000000
+                  },
+                  "limitCost": {
+                    "type": [
+                      "number",
+                      "null"
+                    ],
+                    "exclusiveMinimum": 0,
+                    "maximum": 1000000
+                  },
+                  "warnAtFraction": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "enforce": {
+                    "type": "string",
+                    "enum": [
+                      "hard",
+                      "soft"
+                    ]
+                  },
+                  "onUnknown": {
+                    "type": "string",
+                    "enum": [
+                      "allow",
+                      "block"
+                    ]
+                  },
+                  "expectedVersion": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "budget": {
+                      "$ref": "#/components/schemas/BudgetPolicy"
+                    },
+                    "changed": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "budget",
+                    "changed"
+                  ]
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/missions/{id}/budget": {
+      "patch": {
+        "summary": "Raise, lower or replace the mission's budget limits (tasks blocked only by it resume on the next tick)",
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Unique key per logical mutation; replays return the original result."
+            },
+            "required": true,
+            "description": "Unique key per logical mutation; replays return the original result.",
+            "name": "idempotency-key",
+            "in": "header"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "limitTokens": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "exclusiveMinimum": 0,
+                    "maximum": 10000000000
+                  },
+                  "limitCost": {
+                    "type": [
+                      "number",
+                      "null"
+                    ],
+                    "exclusiveMinimum": 0,
+                    "maximum": 1000000
+                  },
+                  "warnAtFraction": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "enforce": {
+                    "type": "string",
+                    "enum": [
+                      "hard",
+                      "soft"
+                    ]
+                  },
+                  "onUnknown": {
+                    "type": "string",
+                    "enum": [
+                      "allow",
+                      "block"
+                    ]
+                  },
+                  "expectedVersion": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "budget": {
+                      "$ref": "#/components/schemas/BudgetPolicy"
+                    },
+                    "changed": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "budget",
+                    "changed"
+                  ]
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/sessions/{id}": {
       "get": {
         "summary": "Observe a live runtime session",
@@ -2416,12 +2790,7 @@
                                 "type": "string"
                               }
                             },
-                            "required": [
-                              "paneId",
-                              "terminalId",
-                              "workspaceId",
-                              "agentSessionId"
-                            ]
+                            "required": []
                           },
                           "state": {
                             "type": "string",
@@ -3594,6 +3963,10 @@
                       "type": "object",
                       "properties": {
                         "tokens": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "cachedTokens": {
                           "type": "integer",
                           "minimum": 0
                         },

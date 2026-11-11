@@ -1,4 +1,4 @@
-import { blockedTooLong, budgetGuard, stuckDetector } from "@mimir/core";
+import { MISSION_TERMINAL_STATUSES, blockedTooLong, budgetGuard, stuckDetector } from "@mimir/core";
 import type { FastifyInstance } from "fastify";
 import { toBudgetPolicy } from "../orchestrator/orchestrator.js";
 
@@ -36,10 +36,16 @@ export type AttentionEntry =
   | {
       kind: "budget_warning" | "budget_exceeded";
       budgetId: string;
+      scope: "crew" | "mission" | "project";
       missionId: string | null;
       crewId: string | null;
       spentTokens: number;
       spentCost: number;
+      /** The limits spend is measured against (null: unlimited in that dimension). */
+      limitTokens: number | null;
+      limitCost: number | null;
+      /** Bumped by each operator change (`PATCH /v1/crews/:id/budget`, `.../missions/:id/budget`). */
+      budgetVersion: number;
       uncertain: boolean;
     };
 
@@ -92,15 +98,22 @@ export function attentionRoutes(
       crews: [...rm.crews.values()],
     };
     for (const b of rm.budgets.values()) {
+      // A finished mission's budget cannot be raised (409) and gates no more work.
+      const mission = b.missionId === null ? undefined : rm.missions.get(b.missionId);
+      if (mission && MISSION_TERMINAL_STATUSES.has(mission.status)) continue;
       const r = budgetGuard.evaluate(toBudgetPolicy(b), usage, attribution);
       if (!r.warn && !r.exhausted) continue;
       items.push({
         kind: r.exhausted ? "budget_exceeded" : "budget_warning",
         budgetId: b.id,
+        scope: r.scope,
         missionId: b.missionId,
         crewId: b.crewId,
         spentTokens: r.spentTokens,
         spentCost: r.spentCost,
+        limitTokens: b.limitTokens,
+        limitCost: b.limitCost,
+        budgetVersion: b.version,
         uncertain: r.uncertain,
       });
     }

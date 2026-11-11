@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import { MimirError } from "./errors.js";
 import {
   EVENT_TYPES,
@@ -8,6 +9,7 @@ import {
   type EventType,
   parseEvent,
   payloadSchemaFor,
+  toValidationIssues,
 } from "./events.js";
 import { newId } from "./ids.js";
 
@@ -19,6 +21,7 @@ const agentId = newId("agt");
 const sessionId = newId("ses");
 const approvalId = newId("apr");
 const worktreeId = newId("wtr");
+const budgetId = newId("bgt");
 const sha = "b".repeat(40);
 
 const SAMPLE_PAYLOADS: { [K in EventType]: EventPayloadMap[K] } = {
@@ -67,7 +70,15 @@ const SAMPLE_PAYLOADS: { [K in EventType]: EventPayloadMap[K] } = {
   "approval.decided": { approvalId, decision: "approved", actor: "user:local" },
   "approval.expired": { approvalId },
   "budget.warning": { budgetId: newId("bgt"), unit: "tokens", used: 800, limit: 1000 },
-  "budget.exceeded": { budgetId: newId("bgt"), unit: "cost", used: 26, limit: 25 },
+  "budget.exceeded": {
+    budgetId: newId("bgt"),
+    unit: "cost",
+    used: 26,
+    limit: 25,
+    scope: "crew",
+    overBy: 1,
+    budgetVersion: 0,
+  },
   "policy.denied": { action: "git.push", reason: "protected branch", policyId: newId("pol") },
   "recovery.reconciled": { sessions: 3, lostSessionIds: [sessionId], gap: false },
   "recovery.unknown_marked": { entityType: "session", entityId: sessionId, reason: "not found" },
@@ -82,6 +93,17 @@ const SAMPLE_PAYLOADS: { [K in EventType]: EventPayloadMap[K] } = {
   "mission.failed": { from: "active", to: "failed", reason: "task exhausted" },
   "session.input": { text: "please continue", redacted: false },
   "project.created": {
+    project: {
+      id: newId("prj"),
+      name: "demo",
+      repoPath: "/repo",
+      settings: {},
+      createdAt: now,
+      updatedAt: now,
+      version: 0,
+    },
+  },
+  "project.updated": {
     project: {
       id: newId("prj"),
       name: "demo",
@@ -138,6 +160,21 @@ const SAMPLE_PAYLOADS: { [K in EventType]: EventPayloadMap[K] } = {
     },
   },
   "approval.consumed": { approvalId, subject: "pr:tsk_x" },
+  "budget.updated": {
+    budget: {
+      id: budgetId,
+      missionId,
+      crewId: null,
+      limitTokens: 2_000_000,
+      limitCost: null,
+      warnAtFraction: 0.8,
+      enforce: "hard",
+      createdAt: now,
+      updatedAt: now,
+      version: 1,
+    },
+    previous: null,
+  },
 };
 
 function envelope(type: EventType, payload: unknown, extra: Record<string, unknown> = {}) {
@@ -202,12 +239,14 @@ describe("event types", () => {
       "mission.failed",
       "session.input",
       "project.created",
+      "project.updated",
       "crew.created",
       "crew.scheduling_changed",
       "usage.recorded",
       "approval.consumed",
       "artifact.collection_skipped",
       "artifact.collection_truncated",
+      "budget.updated",
     ]);
     expect(EventTypeSchema.safeParse("mission.exploded").success).toBe(false);
   });
@@ -421,5 +460,18 @@ describe("artifact collection events (T12b)", () => {
     const truncated = payloadSchemaFor("artifact.collection_truncated");
     expect(truncated.safeParse({ taskId, found: 3, kept: 2, limit: 2 }).success).toBe(true);
     expect(truncated.safeParse({ taskId, found: 3, kept: -1, limit: 2 }).success).toBe(false);
+  });
+});
+
+describe("toValidationIssues", () => {
+  it("prefixes paths and renders symbol keys as strings", () => {
+    const sym = Symbol("key");
+    const error = new z.ZodError([
+      { code: "custom", path: ["a", 0, sym], message: "bad", input: undefined },
+    ]);
+    expect(toValidationIssues(error, ["payload"])).toEqual([
+      { path: ["payload", "a", 0, "Symbol(key)"], message: "bad", code: "custom" },
+    ]);
+    expect(toValidationIssues(error)[0]?.path).toEqual(["a", 0, "Symbol(key)"]);
   });
 });

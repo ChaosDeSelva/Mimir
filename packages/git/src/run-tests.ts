@@ -13,6 +13,8 @@ export interface RunTestsOptions {
   timeoutMs?: number;
   /** Explicit extra variables passed to the command (on top of the allowlist). */
   env?: Record<string, string>;
+  /** Aborting kills the command's process group; the result then reports the kill signal. */
+  signal?: AbortSignal;
 }
 
 export interface RunTestsResult {
@@ -111,16 +113,19 @@ export async function runTests(
       } catch {
         child.kill("SIGKILL");
       }
-    };
-    const timer = setTimeout(() => {
-      timedOut = true;
-      killTree();
       // A descendant that escaped the process group could hold the pipes open; stop waiting.
       setTimeout(() => {
         child.stdout.destroy();
         child.stderr.destroy();
       }, 2000).unref();
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killTree();
     }, timeoutMs);
+    const onAbort = () => killTree();
+    if (options.signal?.aborted) onAbort();
+    else options.signal?.addEventListener("abort", onAbort, { once: true });
     child.stdout.on("data", (c: Buffer) => out.push(c));
     child.stderr.on("data", (c: Buffer) => err.push(c));
     child.on("error", (e) => {
@@ -128,6 +133,7 @@ export async function runTests(
     });
     child.on("close", (code, signal) => {
       clearTimeout(timer);
+      options.signal?.removeEventListener("abort", onAbort);
       const durationMs = Math.round(performance.now() - started);
       if (spawnError) {
         resolve({

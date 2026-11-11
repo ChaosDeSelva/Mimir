@@ -5,11 +5,12 @@ import { expectNoSeriousA11yViolations } from "../test/axe.js";
 import { agent, event, snapshot, task } from "../test/fixtures.js";
 import { mockClient } from "../test/mockClient.js";
 import { renderWithStore } from "../test/render.js";
-import { AgentInspector, TERMINAL_MIN_INTERVAL_MS } from "./AgentInspector.js";
+import { useNavigate } from "react-router";
+import { AgentInspector, TERMINAL_FOLLOW_MS, TERMINAL_MIN_INTERVAL_MS } from "./AgentInspector.js";
 
 afterEach(() => vi.useRealTimers());
 
-function setup({ noTerminal = false } = {}) {
+function setup({ noTerminal = false, query = "" } = {}) {
   const t = task({ title: "Implement parser", status: "running" });
   const ag = agent({ taskId: t.id, status: "running", agentKind: "claude" });
   const sessionId = ag.runtimeSessionId as string;
@@ -30,7 +31,7 @@ function setup({ noTerminal = false } = {}) {
   }
   const view = renderWithStore(<AgentInspector />, {
     client,
-    route: `/agents/${sessionId}`,
+    route: `/agents/${sessionId}${query}`,
     path: "/agents/:sessionId",
   });
   return { t, ag, sessionId, client, ...view };
@@ -41,7 +42,7 @@ describe("AgentInspector", () => {
     const { t, sessionId, container } = setup();
     expect(await screen.findByRole("heading", { level: 1, name: /Agent/ })).toBeTruthy();
     const state = screen.getByRole("region", { name: "State" });
-    expect(within(state).getByText("running")).toBeTruthy();
+    expect(within(state).getByRole("img", { name: "Status: Working" })).toBeTruthy();
     expect(within(state).getByText("observed")).toBeTruthy();
     expect(within(state).getByText("Implement parser").closest("a")?.getAttribute("href")).toBe(
       `/missions/${t.missionId}`,
@@ -82,6 +83,41 @@ describe("AgentInspector", () => {
     expect(
       within(screen.getByRole("region", { name: "Terminal" })).queryByText("observed"),
     ).toBeNull();
+  });
+
+  it("puts a working agent's terminal first and can follow it every 5 s", async () => {
+    const user = userEvent.setup();
+    const { client, sessionId } = setup();
+    const terminal = await screen.findByRole("region", { name: "Terminal" });
+    const state = screen.getByRole("region", { name: "State" });
+    // The live output comes before the state card.
+    expect(terminal.compareDocumentPosition(state) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    await user.click(within(terminal).getByRole("switch", { name: /Follow/ }));
+    await waitFor(() => expect(client.sessions.terminal).toHaveBeenCalledTimes(1));
+    expect(client.sessions.terminal).toHaveBeenCalledWith(sessionId, { lines: 200 });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(TERMINAL_FOLLOW_MS);
+    });
+    expect(client.sessions.terminal).toHaveBeenCalledTimes(2);
+    await user.click(within(terminal).getByRole("switch", { name: /Follow/ }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(TERMINAL_FOLLOW_MS * 2);
+    });
+    expect(client.sessions.terminal).toHaveBeenCalledTimes(2);
+  });
+
+  it("starts following when opened from a Live output link (?follow=1)", async () => {
+    const { client, sessionId } = setup({ query: "?follow=1" });
+    const terminal = await screen.findByRole("region", { name: "Terminal" });
+    await waitFor(() =>
+      expect(client.sessions.terminal).toHaveBeenCalledWith(sessionId, { lines: 200 }),
+    );
+    expect(
+      within(terminal)
+        .getByRole("switch", { name: /Follow/ })
+        .getAttribute("aria-checked"),
+    ).toBe("true");
   });
 
   it("explains when the runtime cannot read terminals", async () => {
@@ -142,6 +178,108 @@ describe("AgentInspector", () => {
     await screen.findByRole("region", { name: "Cost" });
     await waitFor(() => expect(client.usage.get).toHaveBeenCalledWith({ agentId: ag.id }));
     expect(await screen.findByText("unavailable: 0")).toBeTruthy();
+  });
+
+  it("keeps the terminal text it read when the session ends", async () => {
+    const user = userEvent.setup();
+    const { client, ag } = setup();
+    await user.click(await screen.findByRole("button", { name: "Read terminal" }));
+    expect((await screen.findByTestId("terminal")).textContent).toContain("$ echo hi");
+    act(() =>
+      client.streamController.push(
+        event(
+          "session.state_changed",
+          { from: "running", to: "stopped" },
+          { sessionId: ag.runtimeSessionId as never },
+        ),
+      ),
+    );
+    await waitFor(() => expect(screen.queryByRole("switch", { name: /Follow/ })).toBeNull());
+    expect(screen.getByTestId("terminal").textContent).toContain("$ echo hi");
+  });
+
+  it("stops following when the session ends", async () => {
+    const user = userEvent.setup();
+    const { client, ag } = setup();
+    const terminal = await screen.findByRole("region", { name: "Terminal" });
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    await user.click(within(terminal).getByRole("switch", { name: /Follow/ }));
+    await waitFor(() => expect(client.sessions.terminal).toHaveBeenCalledTimes(1));
+    act(() =>
+      client.streamController.push(
+        event(
+          "session.state_changed",
+          { from: "running", to: "stopped" },
+          { sessionId: ag.runtimeSessionId as never },
+        ),
+      ),
+    );
+    await waitFor(() => expect(screen.queryByRole("switch", { name: /Follow/ })).toBeNull());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(TERMINAL_FOLLOW_MS * 3);
+    });
+    expect(client.sessions.terminal).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops following after a failed read instead of polling on", async () => {
+    const user = userEvent.setup();
+    const { client } = setup();
+    vi.mocked(client.sessions.terminal!).mockRejectedValue(new Error("session gone"));
+    const terminal = await screen.findByRole("region", { name: "Terminal" });
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    await user.click(within(terminal).getByRole("switch", { name: /Follow/ }));
+    expect(await within(terminal).findByText("Could not read the terminal")).toBeTruthy();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(TERMINAL_FOLLOW_MS * 3);
+    });
+    expect(client.sessions.terminal).toHaveBeenCalledTimes(1);
+    expect(
+      within(terminal)
+        .getByRole("switch", { name: /Follow/ })
+        .getAttribute("aria-checked"),
+    ).toBe("false");
+    expect(within(terminal).getByText("Could not read the terminal")).toBeTruthy();
+  });
+
+  it("offers no force stop while a stop request is in flight", async () => {
+    const user = userEvent.setup();
+    const { client } = setup();
+    vi.mocked(client.sessions.stop).mockReturnValueOnce(new Promise(() => undefined));
+    await user.click(await screen.findByRole("button", { name: "Soft stop" }));
+    expect(
+      (screen.getByRole("button", { name: "Force stop…" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("shows nothing of the previous agent after moving to another one", async () => {
+    const user = userEvent.setup();
+    const t = task({ status: "running" });
+    const a1 = agent({ taskId: t.id, status: "running" });
+    const a2 = agent({ status: "running" });
+    const client = mockClient({
+      snapshot: vi.fn(async () => snapshot({ tasks: [t], agents: [a1, a2] })),
+    });
+    function GoTo() {
+      const navigate = useNavigate();
+      return <button onClick={() => void navigate(`/agents/${a2.runtimeSessionId}`)}>next</button>;
+    }
+    renderWithStore(
+      <>
+        <AgentInspector />
+        <GoTo />
+      </>,
+      { client, route: `/agents/${a1.runtimeSessionId}`, path: "/agents/:sessionId" },
+    );
+    await user.click(await screen.findByRole("button", { name: "Read terminal" }));
+    await screen.findByTestId("terminal");
+    await user.click(screen.getByRole("button", { name: "Soft stop" }));
+    expect(await screen.findByText(/Soft stop requested/)).toBeTruthy();
+    await user.type(screen.getByLabelText("Instruction"), "meant for the first agent");
+    await user.click(screen.getByRole("button", { name: "next" }));
+    await waitFor(() => expect(screen.getByText(a2.runtimeSessionId as string)).toBeTruthy());
+    expect(screen.queryByTestId("terminal")).toBeNull();
+    expect(screen.queryByText(/Soft stop requested/)).toBeNull();
+    expect((screen.getByLabelText("Instruction") as HTMLTextAreaElement).value).toBe("");
   });
 
   it("shows not found for an unknown session", async () => {

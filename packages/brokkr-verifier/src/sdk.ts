@@ -46,8 +46,16 @@ export interface BrokkrInstance {
     workspace: string;
     task?: BrokkrTaskDescriptor;
     signal?: AbortSignal;
+    /** What the check environment is filtered from (default: `process.env`). */
+    env?: Readonly<Record<string, string | undefined>>;
     correlationId?: string;
     workspaceId?: string;
+    /**
+     * Full commit id the work under test started from. A required check skipped by its `when`
+     * guard is excluded only if the guard did not hold there either (else `incomplete`).
+     * Brokkr versions without the field ignore it.
+     */
+    baseCommit?: string;
   }): Promise<unknown>;
 }
 

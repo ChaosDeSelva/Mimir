@@ -1,10 +1,12 @@
-import { useCallback, useMemo, useState, type ReactNode } from "react";
-import { BrowserRouter, Link, MemoryRouter, Route, Routes } from "react-router";
+import { Suspense, useCallback, useMemo, useState, type ReactNode } from "react";
+import { BrowserRouter, MemoryRouter, Route, Routes } from "react-router";
 import { createClient, describeError, type ClientOptions, type MimirClient } from "./api/client.js";
 import { SessionContext } from "./api/session.js";
 import { clearToken, loadToken, saveToken } from "./api/token.js";
+import { ActionLink } from "./components/ActionLink.js";
 import { Layout } from "./components/Layout.js";
-import { PageTitle } from "./components/Section.js";
+import { RoutedProviders } from "./components/Providers.js";
+import { Screen } from "./components/Screen.js";
 import { EmptyState, ErrorState } from "./components/StateViews.js";
 import { TokenPrompt } from "./components/TokenPrompt.js";
 import { Activity } from "./screens/Activity.js";
@@ -17,15 +19,31 @@ import { Projects } from "./screens/Projects.js";
 import { Reviews } from "./screens/Reviews.js";
 import { Settings } from "./screens/Settings.js";
 import { StoreProvider } from "./store/StoreProvider.js";
+import { lazyScreen } from "./lib/lazyScreen.js";
+
+// Docs carries every page's text; it loads only when opened.
+const Docs = lazyScreen(() => import("./screens/Docs.js").then((m) => m.Docs));
+const docs = (
+  <Suspense fallback={<p className="p-6 text-sm text-muted">Loading the docs…</p>}>
+    <Docs />
+  </Suspense>
+);
 
 function NotFound() {
   return (
-    <>
-      <PageTitle>Not found</PageTitle>
-      <EmptyState>
-        Nothing lives here. <Link to="/">Go to the overview</Link>.
+    <Screen screen="overview" title="Not found" global>
+      <EmptyState
+        compact={false}
+        body="The address does not match any Mimir page."
+        action={
+          <ActionLink href="/" primary>
+            Go to the overview
+          </ActionLink>
+        }
+      >
+        Nothing lives here
       </EmptyState>
-    </>
+    </Screen>
   );
 }
 
@@ -43,6 +61,8 @@ export function AppRoutes() {
         <Route path="/reviews" element={<Reviews />} />
         <Route path="/activity" element={<Activity />} />
         <Route path="/settings" element={<Settings />} />
+        <Route path="/docs" element={docs} />
+        <Route path="/docs/:slug" element={docs} />
         <Route path="*" element={<NotFound />} />
       </Route>
     </Routes>
@@ -110,15 +130,15 @@ export function App({
         onSubmit={(t) => {
           saveToken(t);
           setRejected(false);
-          setToken(loadToken());
+          setToken(t.trim());
         }}
       />
     );
   }
   if ("error" in client) {
     return (
-      <main id="main" className="p-6">
-        <ErrorState message={client.error} />
+      <main id="main" className="mx-auto max-w-xl p-6">
+        <ErrorState title="Could not start the Mimir client" message={client.error} />
       </main>
     );
   }
@@ -126,7 +146,9 @@ export function App({
     <SessionContext.Provider value={session}>
       <StoreProvider client={client.ok} onUnauthorized={onUnauthorized}>
         <Router initialPath={initialPath}>
-          <AppRoutes />
+          <RoutedProviders>
+            <AppRoutes />
+          </RoutedProviders>
         </Router>
       </StoreProvider>
     </SessionContext.Provider>

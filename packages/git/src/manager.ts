@@ -103,6 +103,17 @@ export interface GitManagerOptions {
   isTaskLive?: (taskId: string) => boolean | Promise<boolean>;
 }
 
+export interface ExportedResult {
+  /** The commit `patch` applies to. */
+  baseSha: string;
+  resultCommit: string;
+  patch: string;
+  /** A rework only: the change since the verified results the work started from. */
+  followUp?: { baseSha: string; patch: string };
+  /** A rework only: why `patch` is the follow-up and not the whole change. */
+  followUpOnly?: string;
+}
+
 export interface RegisterProjectInput {
   projectId: ProjectId;
   repoPath: string;
@@ -216,6 +227,8 @@ const STATUS_CODES: Record<string, FileChangeStatus> = {
   T: "typechange",
 };
 
+/** Date of a combined dependency commit (raw git format); fixed so it does not vary per call. */
+const COMBINED_COMMIT_DATE = "946684800 +0000";
 const DIFF_FLAGS = ["--no-renames", "--no-ext-diff", "--no-textconv", "--no-color"];
 
 function nowIso(): string {
@@ -337,18 +350,31 @@ export class GitManager {
     await assertNoSymlinkBelow(root, path);
 
     await git(repoPath, ["worktree", "add", "--no-track", "-b", branch, path, baseSha]);
-    if ((await realpath(path)) !== path) {
-      await git(repoPath, ["worktree", "remove", "--force", path]).catch(() => undefined);
-      throw new MimirError("validation_failed", "worktree path resolved through a symlink", {
-        path,
+    try {
+      if ((await realpath(path)) !== path) {
+        throw new MimirError("validation_failed", "worktree path resolved through a symlink", {
+          path,
+        });
+      }
+      await this.ensureOwnerFileIgnored(repoPath);
+      const claim: OwnerClaim = { taskId, createdAt: nowIso() };
+      await writeFile(join(path, OWNER_FILE), `${JSON.stringify(claim, null, 2)}\n`, {
+        flag: "wx",
+        mode: 0o600,
+      }).catch((err: unknown) => {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        throw new MimirError(
+          "conflict",
+          `the repository has a file at the worktree claim path ${OWNER_FILE}`,
+          { path: OWNER_FILE },
+        );
       });
+    } catch (err) {
+      // Nothing records this worktree yet: left behind, its branch would block every retry.
+      await git(repoPath, ["worktree", "remove", "--force", path]).catch(() => undefined);
+      await git(repoPath, ["branch", "-D", "--", branch]).catch(() => undefined);
+      throw err;
     }
-    await this.ensureOwnerFileIgnored(repoPath);
-    const claim: OwnerClaim = { taskId, createdAt: nowIso() };
-    await writeFile(join(path, OWNER_FILE), `${JSON.stringify(claim, null, 2)}\n`, {
-      flag: "wx",
-      mode: 0o600,
-    });
 
     const ts = nowIso();
     const worktree: Worktree = {
@@ -626,11 +652,14 @@ export class GitManager {
     const repo = await this.registerProject({ projectId: id, repoPath });
     await auditRepoConfig(repo);
     const scratch = await ScratchRepo.open(join(await this.ensureRoot(), SCRATCH_DIR), id, repo);
-    const commits: string[] = [];
-    for (const task of [...new Set(taskIds)].sort()) {
+    const resolved: string[] = [];
+    for (const task of new Set(taskIds)) {
       const parsed = GitShaSchema.parse(task);
-      commits.push(await resolveCommit(repo, parsed, "verified dependency commit"));
+      resolved.push(await resolveCommit(repo, parsed, "verified dependency commit"));
     }
+    // Sorted full shas: an abbreviated and a full form of one commit are one input, and equal
+    // inputs combine in the same order.
+    const commits = [...new Set(resolved)].sort();
     let base = commits[0]!;
     for (const next of commits.slice(1)) {
       const merge = await scratch.run(
@@ -649,42 +678,90 @@ export class GitManager {
         tree,
         [base, next],
         "Combine verified task dependencies",
+        COMBINED_COMMIT_DATE,
       );
     }
     await this.importResult(repo, scratch, base);
     return base;
   }
 
-  /** A binary-safe patch of immutable verified results, never the current agent worktree. */
+  /**
+   * A binary-safe patch of immutable verified results, never the current agent worktree.
+   *
+   * With `fromDefaultBranch` (work that started from earlier verified results, a rework) `patch`
+   * is the whole change against the default branch, and `followUp` is the change since the
+   * results the work started from, for a checkout that already has the earlier delivery applied.
+   * When no base on the default branch can be determined, `patch` is that follow-up and
+   * `followUpOnly` says why. When the default branch already contains what the work started from,
+   * the two are the same patch and there is no `followUp`.
+   */
   async exportResult(
     projectId: string,
     repoPath: string,
     bases: readonly string[],
     results: readonly string[],
-  ): Promise<{ baseSha: string; resultCommit: string; patch: string }> {
+    opts: { fromDefaultBranch?: boolean } = {},
+  ): Promise<ExportedResult> {
     if (!bases.length || !results.length)
       throw new MimirError("conflict", "no verified result to export");
     const resultCommit = (await this.dependencyBase(projectId, repoPath, results))!;
     const id = this.parseId(ProjectIdSchema, projectId, "projectId");
     const repo = await this.registerProject({ projectId: id, repoPath });
     const scratch = await ScratchRepo.open(join(await this.ensureRoot(), SCRATCH_DIR), id, repo);
-    const roots = [...new Set(bases)].map((sha) => GitShaSchema.parse(sha));
-    const baseSha =
-      roots.length === 1
-        ? roots[0]!
-        : (await scratch.run(["merge-base", "--octopus", ...roots])).stdout.trim();
-    const patch = (
-      await scratch.run([
-        "diff",
-        ...DIFF_FLAGS,
-        "--binary",
-        "--full-index",
-        baseSha,
+    const mergeBase = async (shas: string[]) =>
+      shas.length === 1
+        ? shas[0]!
+        : (await scratch.run(["merge-base", "--octopus", ...shas])).stdout.trim();
+    const patchFrom = async (base: string) => {
+      const diff = ["diff", ...DIFF_FLAGS, "--binary", "--full-index", base, resultCommit, "--"];
+      const text = (await scratch.run(diff)).stdout;
+      // U+FFFD: bytes that are not UTF-8 (a Latin-1 source file) were lost in decoding and the
+      // patch would not apply. Those files are exported as binary patches, which are ASCII.
+      if (!text.includes("\uFFFD")) return text;
+      const binary = (
+        await scratch.run([
+          "-c",
+          `core.attributesFile=${await scratch.binaryAttributes()}`,
+          "-c",
+          "core.quotePath=true",
+          ...diff,
+        ])
+      ).stdout;
+      const perFile = (patch: string) => patch.split(/^(?=diff --git )/m);
+      const [readable, safe] = [perFile(text), perFile(binary)];
+      if (readable.length !== safe.length) return binary;
+      return readable.map((part, i) => (part.includes("\uFFFD") ? safe[i] : part)).join("");
+    };
+    const ownBase = await mergeBase([...new Set(bases)].map((sha) => GitShaSchema.parse(sha)));
+    const own = { baseSha: ownBase, patch: await patchFrom(ownBase) };
+    if (!opts.fromDefaultBranch) return { ...own, resultCommit };
+    // Not a failed delivery: no default branch (detached HEAD without origin/HEAD), or one that
+    // shares no history with the work.
+    // Only these two outcomes mean "follow-up only". Any other git failure is an error to
+    // surface and retry, not a reason to record a delivery that silently lacks the whole change.
+    const tip = await this.defaultBranch(repo)
+      .then((branch) => resolveCommit(repo, branch, "default branch"))
+      .catch((err: unknown) => {
+        const code = err instanceof MimirError ? err.code : undefined;
+        if (code === "validation_failed" || code === "not_found") return undefined;
+        throw err;
+      });
+    if (tip === undefined)
+      return { ...own, resultCommit, followUpOnly: "the default branch could not be determined" };
+    // `git merge-base` exits 1 when the commits share no ancestor.
+    const baseSha = await mergeBase([ownBase, tip]).catch((err: unknown) => {
+      const exit = err instanceof MimirError ? (err.details as { exitCode?: number }).exitCode : 0;
+      if (exit === 1) return undefined;
+      throw err;
+    });
+    if (baseSha === undefined)
+      return {
+        ...own,
         resultCommit,
-        "--",
-      ])
-    ).stdout;
-    return { baseSha, resultCommit, patch };
+        followUpOnly: "the default branch shares no history with the delivered work",
+      };
+    if (baseSha === ownBase) return { ...own, resultCommit };
+    return { baseSha, resultCommit, patch: await patchFrom(baseSha), followUp: own };
   }
 
   private async resultCommit(
@@ -692,6 +769,8 @@ export class GitManager {
     tree: string,
     parents: string[],
     message: string,
+    /** Fixed author and committer date: the same tree and parents then give the same sha. */
+    date?: string,
   ): Promise<string> {
     return (
       await scratch.run(
@@ -702,6 +781,7 @@ export class GitManager {
             GIT_AUTHOR_EMAIL: "mimir@localhost",
             GIT_COMMITTER_NAME: "Mimir",
             GIT_COMMITTER_EMAIL: "mimir@localhost",
+            ...(date !== undefined ? { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } : {}),
           },
         },
       )
@@ -719,6 +799,8 @@ export class GitManager {
       "fetch",
       "--no-tags",
       "--no-write-fetch-head",
+      // `fetch.recurseSubmodules` in the repo config would fetch with each submodule's config.
+      "--no-recurse-submodules",
       scratch.gitDir,
       sha,
     ]);
@@ -735,24 +817,26 @@ export class GitManager {
       "sinceSha",
       { env: { GIT_DIR: scratch.gitDir, GIT_CONFIG_GLOBAL: "/dev/null" } },
     );
+    // NUL is the only byte a commit's author or subject cannot carry, so it alone separates
+    // both fields and records.
     const r = await scratch.run([
       "log",
       "--no-show-signature",
       "--reverse",
       "--no-color",
-      "--format=%H%x00%an%x00%ae%x00%aI%x00%s%x1e",
+      "-z",
+      "--format=%H%x00%an%x00%ae%x00%aI%x00%s",
       `${since}..${headSha}`,
       "--",
     ]);
-    return r.stdout
-      .split("\x1e")
-      .map((s) => s.replace(/^\n/, ""))
-      .filter(Boolean)
-      .map((line) => {
-        const [sha = "", authorName = "", authorEmail = "", authoredAt = "", subject = ""] =
-          line.split("\0");
-        return { sha, authorName, authorEmail, authoredAt, subject };
-      });
+    const fields = r.stdout.split("\0");
+    const commits: CommitInfo[] = [];
+    for (let i = 0; i + 4 < fields.length; i += 5) {
+      const [sha = "", authorName = "", authorEmail = "", authoredAt = "", subject = ""] =
+        fields.slice(i, i + 5);
+      commits.push({ sha, authorName, authorEmail, authoredAt, subject });
+    }
+    return commits;
   }
 
   /**

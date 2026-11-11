@@ -134,10 +134,40 @@ const KNOWN_PREFIXES = [
   "artifact.",
 ];
 
+// Payloads are not validated, so a newer server can name a status this build cannot place.
+const TASK_STATUSES: Record<Task["status"], true> = {
+  pending: true,
+  ready: true,
+  leased: true,
+  running: true,
+  verifying: true,
+  completed: true,
+  blocked: true,
+  failed: true,
+  cancelled: true,
+};
+const MISSION_STATUSES: Record<Mission["status"], true> = {
+  draft: true,
+  active: true,
+  paused: true,
+  completed: true,
+  cancelled: true,
+  failed: true,
+};
+
+/** A transition to a status this build does not know (left unfolded; the snapshot is reloaded). */
+function unknownTransition(event: EventEnvelope): boolean {
+  const to = (event.payload as { to?: unknown } | null)?.to;
+  if (typeof to !== "string") return false;
+  if (event.type.startsWith("task.")) return !Object.hasOwn(TASK_STATUSES, to);
+  if (event.type.startsWith("mission.")) return !Object.hasOwn(MISSION_STATUSES, to);
+  return false;
+}
+
 /** Events that create or reshape entities; the UI reloads the snapshot after them. */
 export function needsSnapshotRefresh(event: EventEnvelope): boolean {
   const type = event.type as string;
-  if (REFRESH_TYPES.has(type)) return true;
+  if (REFRESH_TYPES.has(type) || unknownTransition(event)) return true;
   // Types this protocol version does not define (project.created, crew.created, ...).
   return !KNOWN_PREFIXES.some((p) => type.startsWith(p));
 }
@@ -167,23 +197,46 @@ function withoutBlockedReason(t: Task): Task {
 function foldEvent(state: State, e: EventEnvelope): State {
   const p = e.payload as Record<string, unknown>;
   const type = e.type;
+  if (unknownTransition(e)) return state;
 
   if (type.startsWith("task.") && type !== "task.created") {
     const to = p["to"] as Task["status"] | undefined;
     if (to === undefined) return state;
+    // Mirrors the server read model's task projection, so a live fold and a snapshot agree.
     const tasks = updateById(state.tasks, e.taskId, (t) => {
       let next: Task = { ...withoutBlockedReason(t), status: to, updatedAt: e.occurredAt };
-      if (typeof p["attempt"] === "number") next = { ...next, attempt: p["attempt"] };
       if (type === "task.leased") {
         const pl = p as EventPayloadMap["task.leased"];
-        next = { ...next, agentId: pl.agentId, leaseExpiresAt: pl.leaseExpiresAt };
-      }
-      if (type === "task.started") {
-        next = { ...next, agentId: (p as EventPayloadMap["task.started"]).agentId };
-      }
-      if (type === "task.blocked") {
+        // The payload's attempt number is 1-based; `Task.attempt` is the 0-based index.
+        next = {
+          ...next,
+          agentId: pl.agentId,
+          attempt: pl.attempt - 1,
+          leaseExpiresAt: pl.leaseExpiresAt,
+        };
+      } else if (type === "task.started") {
+        const pl = p as EventPayloadMap["task.started"];
+        next = { ...next, agentId: pl.agentId };
+        // verifying -> running is a verification retry: the next attempt starts. Only from a task
+        // still verifying: a refresh re-folds events over a snapshot that may already count it.
+        if (pl.from === "verifying" && t.status === "verifying") {
+          next = { ...next, attempt: t.attempt + 1 };
+        }
+      } else if (type === "task.failed") {
+        next = { ...next, attempt: (p as EventPayloadMap["task.failed"]).attempt };
+      } else if (type === "task.retried") {
+        next = { ...next, attempt: (p as EventPayloadMap["task.retried"]).attempt, agentId: null };
+      } else if (type === "task.blocked") {
         next = { ...next, blockedReason: (p as EventPayloadMap["task.blocked"]).reason };
+      } else if (type === "task.completed") {
+        const commit = (p as EventPayloadMap["task.completed"]).resultCommit;
+        if (commit !== undefined) next = { ...next, resultCommit: commit };
       }
+      if (to === "completed" || to === "failed" || to === "cancelled" || to === "ready") {
+        next = { ...next, leaseExpiresAt: null };
+      }
+      // A lease given back (`launch_deferred`) leaves no agent on the task.
+      if (type === "task.ready") next = { ...next, agentId: null };
       return next;
     });
     return tasks === state.tasks ? state : { ...state, tasks };
@@ -248,6 +301,15 @@ function foldEvent(state: State, e: EventEnvelope): State {
       at: e.occurredAt,
     };
     return { ...state, budgetAlerts: { ...state.budgetAlerts, [pl.budgetId]: alert } };
+  }
+
+  if (type === "budget.updated") {
+    // New limits: an earlier alert no longer applies (the server re-reports against them).
+    const id = (p as EventPayloadMap["budget.updated"]).budget.id;
+    if (!(id in state.budgetAlerts)) return state;
+    const budgetAlerts = { ...state.budgetAlerts };
+    delete budgetAlerts[id];
+    return { ...state, budgetAlerts };
   }
 
   return state;

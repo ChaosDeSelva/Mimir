@@ -1,16 +1,23 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import type { AuditLog, CommandLedger, EventStore, PolicyRule } from "@mimir/core";
+import {
+  redactPayload,
+  type AuditLog,
+  type CommandLedger,
+  type EventStore,
+  type PayloadRedactor,
+  type PolicyRule,
+} from "@mimir/core";
 import { GitManager } from "@mimir/git";
 import type { RuntimeAdapter } from "@mimir/protocol";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import type { Logger } from "pino";
 import { registerSecurity } from "./auth.js";
 import { registerBodyDepthGuard } from "./body-depth.js";
 import { DEFAULT_ALLOWED_ORIGINS } from "./config.js";
 import type { ServerContext } from "./context.js";
-import { registerErrorHandling } from "./errors.js";
+import { registerErrorHandling, toMimirError } from "./errors.js";
 import { failInterruptedCommands, registerIdempotencyGuard } from "./idempotency.js";
 import { migrateLegacyProjects } from "./legacy-projects.js";
 import { ReadModel } from "./readmodel.js";
@@ -32,6 +39,7 @@ import {
   DEFAULT_STUCK_THRESHOLD_MS,
   attentionRoutes,
 } from "./routes/attention.js";
+import { budgetRoutes } from "./routes/budgets.js";
 import { crewRoutes } from "./routes/crews.js";
 import { missionRoutes } from "./routes/missions.js";
 import { sessionRoutes } from "./routes/sessions.js";
@@ -54,6 +62,11 @@ export const DEFAULT_SSE_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
 
 export interface BuildServerOptions {
   store: EventStore;
+  /**
+   * The `payloadRedactor` `store` was opened with (default: `redactPayload`, no extra patterns).
+   * Project fields it would rewrite are refused instead of being stored rewritten.
+   */
+  payloadRedactor?: PayloadRedactor;
   ledger: CommandLedger;
   audit: AuditLog;
   runtime: RuntimeAdapter | null;
@@ -106,6 +119,8 @@ export interface BuildServerOptions {
   webRoot?: string;
   /** Ticks between periodic runtime reconciles (`MIMIR_RECONCILE_EVERY_TICKS`, default 30). */
   reconcileEveryTicks?: number;
+  /** Longest a task waits for a free fleet worker (`MIMIR_CAPACITY_WAIT_MS`, default 30 min). */
+  capacityWaitMs?: number;
   /** Set when the runtime adapter reports measured usage (the local CLI adapter does). */
   runtimeReportsUsage?: boolean;
 }
@@ -128,6 +143,11 @@ export function buildServer(opts: BuildServerOptions): FastifyInstance {
   const app = Fastify({
     ...(opts.logger ? { loggerInstance: opts.logger } : { logger: false }),
     ...(opts.https ? { https: opts.https } : {}),
+    // Errors Fastify raises before routing (a malformed URL) bypass the error handler.
+    frameworkErrors: (err, _request, reply) => {
+      const mimir = toMimirError(err);
+      void (reply as FastifyReply).code(mimir.status).send(mimir.toBody());
+    },
   }) as unknown as FastifyInstance;
 
   const readModel = ReadModel.load(opts.store, {
@@ -164,6 +184,7 @@ export function buildServer(opts: BuildServerOptions): FastifyInstance {
     ...(opts.reconcileEveryTicks !== undefined
       ? { reconcileEveryTicks: opts.reconcileEveryTicks }
       : {}),
+    ...(opts.capacityWaitMs !== undefined ? { capacityWaitMs: opts.capacityWaitMs } : {}),
   });
   const retentionDays = opts.artifactRetentionDays ?? DEFAULT_ARTIFACT_RETENTION_DAYS;
   const pruneArtifacts = () => {
@@ -183,6 +204,7 @@ export function buildServer(opts: BuildServerOptions): FastifyInstance {
     runtimeReportsUsage: opts.runtimeReportsUsage ?? false,
     artifacts,
     allowedRoots: opts.allowedRoots ?? [],
+    payloadRedactor: opts.payloadRedactor ?? ((p) => redactPayload(p)),
     sse: {
       heartbeatMs: opts.sseHeartbeatMs ?? DEFAULT_SSE_HEARTBEAT_MS,
       maxBufferBytes: opts.sseMaxBufferBytes ?? DEFAULT_SSE_MAX_BUFFER_BYTES,
@@ -244,6 +266,17 @@ export function buildServer(opts: BuildServerOptions): FastifyInstance {
     readModel.detach();
   });
 
+  // close() drops idle keep-alive sockets once, before it waits for the rest. A streamed body
+  // (artifact content, web files) can reach the client before its response ends, so that socket
+  // goes idle only after the sweep and would hold close() for the keep-alive timeout (72 s).
+  let closing = false;
+  app.addHook("preClose", async () => {
+    closing = true;
+  });
+  app.addHook("onResponse", async () => {
+    if (closing) setImmediate(() => app.server.closeIdleConnections());
+  });
+
   registerErrorHandling(app);
   registerSecurity(app, {
     authToken: opts.authToken,
@@ -263,6 +296,7 @@ export function buildServer(opts: BuildServerOptions): FastifyInstance {
   projectRoutes(app);
   missionRoutes(app);
   crewRoutes(app);
+  budgetRoutes(app);
   taskRoutes(app);
   approvalRoutes(app);
   sessionRoutes(app);

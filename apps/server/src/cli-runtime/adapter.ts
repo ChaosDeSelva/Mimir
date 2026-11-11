@@ -1,4 +1,5 @@
 import { fork, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
@@ -10,9 +11,67 @@ import {
   type RuntimeSessionSpec,
 } from "@mimir/protocol";
 
-type Usage = { tokens: number; estimatedCost: number | null };
+type Usage = { tokens: number; estimatedCost: number | null; cachedTokens: number };
+type RawUsage = {
+  input_tokens?: unknown;
+  output_tokens?: unknown;
+  cached_input_tokens?: unknown;
+  cache_creation_input_tokens?: unknown;
+  cache_read_input_tokens?: unknown;
+};
+const count = (v: unknown): number | null =>
+  typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.round(v) : null;
+
+/**
+ * Budget usage of one agent JSONL event, or null for an event that does not report it.
+ *
+ * - Codex `exec --json` `turn.completed`: `usage` is the thread's running total
+ *   (`total_token_usage`), not the turn's delta, so the last one is the session's total and the
+ *   caller keeps only the last (summing them would count earlier turns again). `input_tokens`
+ *   sums the input of every model request in the turn and INCLUDES `cached_input_tokens`; each
+ *   request re-sends the context, so ~90% of it is cache hits (live: 259,194 input of which
+ *   235,520 cached). `output_tokens` already includes `reasoning_output_tokens`.
+ *   Counted: (input - cached) + output, Codex's own "blended total". Cached: cached_input_tokens.
+ * - Claude `stream-json` `result`: totals for the whole run. `input_tokens` EXCLUDES the cache:
+ *   `cache_creation_input_tokens` is fresh input written to the cache (counted, it is real new
+ *   context), `cache_read_input_tokens` is re-read context (not counted, reported as cached).
+ *   Counted: input + cache_creation + output. Cached: cache_read.
+ */
+export function usageOfEvent(line: string): Usage | null {
+  let e: { type?: unknown; usage?: RawUsage; total_cost_usd?: unknown };
+  try {
+    e = JSON.parse(line) as typeof e;
+  } catch {
+    return null; // terminal output is not necessarily a JSON event
+  }
+  if (e === null || typeof e !== "object" || !e.usage || typeof e.usage !== "object") return null;
+  const u = e.usage;
+  const input = count(u.input_tokens);
+  const output = count(u.output_tokens);
+  if (input === null || output === null) return null;
+  let tokens: number;
+  let cachedTokens: number;
+  if (e.type === "turn.completed") {
+    cachedTokens = Math.min(count(u.cached_input_tokens) ?? 0, input);
+    tokens = input - cachedTokens + output;
+  } else if (e.type === "result") {
+    cachedTokens = count(u.cache_read_input_tokens) ?? 0;
+    tokens = input + (count(u.cache_creation_input_tokens) ?? 0) + output;
+  } else return null;
+  const cost = e.total_cost_usd;
+  return {
+    tokens,
+    cachedTokens,
+    estimatedCost: typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : null,
+  };
+}
+/** Finished sessions kept readable (each holds up to 2 MiB of terminal text); older ones are forgotten. */
+export const FINISHED_SESSIONS_KEPT = 50;
+/** Idempotency keys of forgotten sessions, kept so a replay is refused instead of relaunched. */
+export const FORGOTTEN_LAUNCHES_KEPT = 1000;
 type Entry = {
   session: RuntimeSession;
+  key: string;
   worker: ChildProcess;
   done: Promise<void>;
   stopped: boolean;
@@ -22,11 +81,17 @@ type Entry = {
   usage?: Usage;
 };
 
+const digest = (text: string) => createHash("sha256").update(text).digest("hex");
+
 /** Local non-interactive CLIs, supervised through an IPC watchdog. */
 export class CliRuntime implements RuntimeAdapter {
   private readonly sessions = new Map<string, Entry>();
   private readonly keys = new Map<string, string>();
   private readonly requests = new Map<string, string>();
+  /** Request fingerprint hash by idempotency key of evicted sessions, oldest first. */
+  private readonly forgotten = new Map<string, string>();
+  /** Sessions whose watchdog has ended, oldest first. */
+  private readonly finished = new Set<string>();
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
   constructor(
     private readonly executables: Partial<
@@ -71,6 +136,18 @@ export class CliRuntime implements RuntimeAdapter {
         );
       return this.sessions.get(known)!.session;
     }
+    const forgotten = this.forgotten.get(spec.idempotencyKey);
+    if (forgotten !== undefined) {
+      if (forgotten !== digest(fingerprint))
+        throw new MimirError(
+          "idempotency_replay_mismatch",
+          "Session launch differs from the original request",
+        );
+      throw new MimirError(
+        "conflict",
+        "Session launch already finished and is no longer in runtime memory",
+      );
+    }
     if (this.sessions.has(spec.sessionId))
       throw new MimirError("conflict", "Session ID already belongs to another launch");
     if (!["codex", "claude", "opencode", "gemini", "pi"].includes(spec.agentKind))
@@ -112,7 +189,15 @@ export class CliRuntime implements RuntimeAdapter {
         execArgv: [],
       },
     );
-    let finish!: () => void;
+    let resolveDone!: () => void;
+    let finished = false;
+    // `error` and `exit` may both arrive; a second retire would re-add an evicted session.
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      resolveDone();
+      this.retire(spec.sessionId);
+    };
     const entry: Entry = {
       session: {
         sessionId: spec.sessionId,
@@ -122,12 +207,13 @@ export class CliRuntime implements RuntimeAdapter {
         cwd: spec.cwd,
         lastObservedAt: new Date().toISOString(),
       },
+      key: spec.idempotencyKey,
       worker,
       stopped: false,
       pending: "",
       terminal: "",
       done: new Promise<void>((resolve) => {
-        finish = resolve;
+        resolveDone = resolve;
       }),
     };
     this.sessions.set(spec.sessionId, entry);
@@ -197,8 +283,21 @@ export class CliRuntime implements RuntimeAdapter {
       }
       finish();
     });
+    // `exit` may never follow `error` (spawn failure): end the session here, and close a watchdog
+    // that is still connected so it kills its agent rather than leaving it unsupervised.
     worker.on("error", () => {
       entry.failure = "worker_unavailable";
+      if (entry.session.state === "running") {
+        entry.session.state = "failed";
+        this.emit({
+          kind: "session.state_changed",
+          sessionId: spec.sessionId,
+          state: "failed",
+          runtimeStatus: entry.failure,
+          observedAt: new Date().toISOString(),
+        });
+      }
+      if (worker.connected) worker.disconnect();
       finish();
     });
     worker.send({
@@ -224,46 +323,43 @@ export class CliRuntime implements RuntimeAdapter {
             "MIMIR_TMUX_BIN",
           ].flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]!]])),
         ),
+        ...spec.agentEnv?.env,
+        ...(spec.agentEnv?.pathPrepend?.length
+          ? {
+              PATH: [
+                ...spec.agentEnv.pathPrepend,
+                ...(process.env["PATH"] ? [process.env["PATH"]] : []),
+              ].join(":"),
+            }
+          : {}),
         ...spec.env,
       },
       timeoutMs: spec.timeoutMs,
     });
     return entry.session;
   }
-  private parseUsage(entry: Entry, line: string) {
-    try {
-      const e = JSON.parse(line) as {
-        type?: string;
-        usage?: {
-          input_tokens?: number;
-          output_tokens?: number;
-          cache_creation_input_tokens?: number;
-          cache_read_input_tokens?: number;
-        };
-        total_cost_usd?: number;
-      };
-      if (!e.usage || !["turn.completed", "result"].includes(e.type ?? "")) return;
-      const u = e.usage;
-      if (typeof u.input_tokens !== "number" || typeof u.output_tokens !== "number") return;
-      const tokens =
-        u.input_tokens +
-        u.output_tokens +
-        (e.type === "result"
-          ? (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0)
-          : 0);
-      if (!Number.isFinite(tokens) || tokens < 0) return;
-      entry.usage = {
-        tokens,
-        estimatedCost:
-          typeof e.total_cost_usd === "number" &&
-          Number.isFinite(e.total_cost_usd) &&
-          e.total_cost_usd >= 0
-            ? e.total_cost_usd
-            : null,
-      };
-    } catch {
-      /* terminal output is not necessarily a JSON event */
+  private retire(id: string) {
+    this.finished.add(id);
+    for (const old of this.finished) {
+      if (this.finished.size <= FINISHED_SESSIONS_KEPT) break;
+      const entry = this.sessions.get(old);
+      this.sessions.delete(old);
+      if (entry) {
+        this.forgotten.set(entry.key, digest(this.requests.get(entry.key) ?? ""));
+        for (const key of this.forgotten.keys()) {
+          if (this.forgotten.size <= FORGOTTEN_LAUNCHES_KEPT) break;
+          this.forgotten.delete(key);
+        }
+        this.keys.delete(entry.key);
+        this.requests.delete(entry.key);
+      }
+      this.finished.delete(old);
     }
+  }
+  private parseUsage(entry: Entry, line: string) {
+    // Both CLIs report running totals: the last event is the session's usage.
+    const usage = usageOfEvent(line);
+    if (usage) entry.usage = usage;
   }
   private emit(event: RuntimeEvent) {
     for (const listener of this.listeners) listener(event);
