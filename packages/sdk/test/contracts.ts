@@ -141,6 +141,10 @@ export const CONTRACT_SCHEMAS: Record<string, { request?: Schema; response?: Sch
     request: CancelMissionRequestSchema,
     response: OperationAcceptedSchema,
   },
+  "POST /v1/missions/{id}/reopen": {
+    request: CancelMissionRequestSchema,
+    response: OperationAcceptedSchema,
+  },
   "POST /v1/crews": { request: CreateCrewRequestSchema, response: CreateCrewResponseSchema },
   "GET /v1/crews": { response: ListCrewsResponseSchema },
   "GET /v1/tasks": { response: ListTasksResponseSchema },
@@ -325,6 +329,8 @@ export async function generateContracts(): Promise<Map<string, unknown>> {
       },
       "POST /v1/missions/{id}/start": () => client.missions.start(open.id),
       "POST /v1/missions/{id}/cancel": () => client.missions.cancel(mission.id, { reason: "done" }),
+      "POST /v1/missions/{id}/reopen": () =>
+        client.missions.reopen(mission.id, { reason: "restart" }),
       "POST /v1/crews": () =>
         client.crews.create({
           missionId: open.id,

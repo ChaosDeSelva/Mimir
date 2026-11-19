@@ -25,6 +25,7 @@ const ENDPOINTS = [
   "POST /v1/missions/{id}/decision-log",
   "POST /v1/missions/:id/start",
   "POST /v1/missions/:id/cancel",
+  "POST /v1/missions/:id/reopen",
   "POST /v1/crews",
   "GET /v1/crews",
   "POST /v1/crews/:id/pause",
@@ -196,11 +197,11 @@ describe("generateEventEnvelopeJsonSchema", () => {
 });
 
 describe("versioning (T12b)", () => {
-  it("info.version is the protocol package version, which is 0.5.0", () => {
+  it("info.version is the protocol package version, which is 0.5.1", () => {
     const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
       version: string;
     };
-    expect(pkg.version).toBe("0.5.0");
+    expect(pkg.version).toBe("0.5.1");
     expect(PROTOCOL_PACKAGE_VERSION).toBe(pkg.version);
     expect(generateOpenApi().info.version).toBe(pkg.version);
   });

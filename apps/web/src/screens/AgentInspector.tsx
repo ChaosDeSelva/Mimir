@@ -1,5 +1,6 @@
 import type { AgentId, SessionId } from "@mimir/protocol";
 import {
+  AgentTranscript,
   Button,
   ConfirmDialog,
   Field,
@@ -10,7 +11,7 @@ import {
   Textarea,
   Timestamp,
 } from "@factory/ui";
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { useLocation, useParams } from "react-router";
 import { describeError, type TerminalReadResponse } from "../api/client.js";
 import { ActionResult } from "../components/ActionResult.js";
@@ -46,7 +47,6 @@ function Terminal({ sessionId, live }: { sessionId: SessionId; live: boolean }) 
   );
   // An ended session has nothing new to show, so following stops with it.
   const following = follow && live;
-  const preRef = useRef<HTMLPreElement>(null);
 
   useEffect(() => {
     if (!cooling) return;
@@ -77,11 +77,6 @@ function Terminal({ sessionId, live }: { sessionId: SessionId; live: boolean }) 
     const t = setInterval(() => void load(), TERMINAL_FOLLOW_MS);
     return () => clearInterval(t);
   }, [following, load]);
-
-  useEffect(() => {
-    const pre = preRef.current;
-    if (pre) pre.scrollTop = pre.scrollHeight;
-  }, [data]);
 
   const caps = useAsync(() => client.capabilities(), "caps");
   if (caps.status === "ready" && !caps.data.runtime?.features.terminalRead) {
@@ -122,15 +117,10 @@ function Terminal({ sessionId, live }: { sessionId: SessionId; live: boolean }) 
             {data.provenance && <ProvenanceBadge provenance={data.provenance} />}
             {data.capturedAt && <Timestamp value={data.capturedAt} prefix="Captured" />}
           </p>
-          <pre
-            ref={preRef}
-            data-testid="terminal"
-            tabIndex={0}
-            aria-label="Terminal output"
-            className="max-h-[28rem] overflow-auto rounded-md bg-zinc-950 p-4 font-mono text-xs leading-relaxed whitespace-pre text-zinc-100"
-          >
-            {data.text}
-          </pre>
+          {/* Agent CLIs print JSON events; the transcript makes them readable, Raw shows them as-is. */}
+          <div data-testid="terminal">
+            <AgentTranscript lines={data.text.split("\n")} maxHeight="28rem" />
+          </div>
         </>
       )}
     </div>
@@ -139,6 +129,9 @@ function Terminal({ sessionId, live }: { sessionId: SessionId; live: boolean }) 
 
 function Controls({ sessionId }: { sessionId: SessionId }) {
   const { client } = useStore();
+  const caps = useAsync(() => client.capabilities(), "caps");
+  // Non-interactive runtimes (`claude -p`, `codex exec`) take no input once an agent runs.
+  const canMessage = caps.status !== "ready" || caps.data.runtime?.features.sendInput !== false;
   const [text, setText] = useState("");
   const [confirmForce, setConfirmForce] = useState(false);
   const input = useAction();
@@ -148,25 +141,39 @@ function Controls({ sessionId }: { sessionId: SessionId }) {
     if (!text.trim()) return;
     const r = await input.run(
       () => client.sessions.input(sessionId, { text: text.trim() }),
-      () => "Instruction sent",
+      () => "Message sent",
     );
     if (r) setText("");
   };
   const denied = stop.outcome?.kind === "error" && stop.outcome.error.code === "policy_denied";
   return (
     <>
-      <Section title="Inputs" description="Typed into the agent's session as if at its prompt.">
-        <form onSubmit={(e) => void send(e)} className="flex max-w-2xl flex-col gap-field">
-          <Field label="Instruction">
-            <Textarea value={text} onChange={(e) => setText(e.target.value)} rows={3} />
-          </Field>
-          <div>
-            <Button type="submit" variant="primary" loading={input.busy}>
-              Send instruction
-            </Button>
-          </div>
-          <ActionResult outcome={input.outcome} />
-        </form>
+      <Section
+        title="Message the agent"
+        description={
+          canMessage
+            ? "Typed into the agent's session as if at its prompt; the agent reads it on its next turn. Use it to steer an agent that is going off track."
+            : "This runtime runs agents non-interactively, so a running agent cannot take a message. To change its direction, stop it and retry the task with a note."
+        }
+      >
+        {canMessage ? (
+          <form onSubmit={(e) => void send(e)} className="flex max-w-2xl flex-col gap-field">
+            <Field label="Message">
+              <Textarea
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+                rows={3}
+                placeholder="For example: Stop exploring. Only read src/api and src/jobs, then write the document."
+              />
+            </Field>
+            <div>
+              <Button type="submit" variant="primary" loading={input.busy}>
+                Send message
+              </Button>
+            </div>
+            <ActionResult outcome={input.outcome} />
+          </form>
+        ) : null}
       </Section>
       <Section
         title="Controls"
@@ -190,8 +197,7 @@ function Controls({ sessionId }: { sessionId: SessionId }) {
             </Button>
           </div>
           <p className="text-sm text-muted">
-            Force stop requires an approved runtime.force_stop request; without it the server
-            refuses (403).
+            Force stop needs an approval first (decided in Reviews); without one it is refused.
           </p>
           <ActionResult outcome={stop.outcome} />
           {denied && (
@@ -208,7 +214,7 @@ function Controls({ sessionId }: { sessionId: SessionId }) {
           open={confirmForce}
           onOpenChange={setConfirmForce}
           title="Force stop this agent?"
-          description="The session is killed at once; unsaved work in it is lost."
+          description="The session is killed at once; unsaved work in it is lost. This needs an approved force-stop request: without one, Mimir refuses and asks you to decide it in Reviews."
           confirmLabel="Confirm force stop"
           tone="danger"
           onConfirm={() => {
@@ -264,7 +270,9 @@ export function AgentInspector() {
   const timeline = state.events.filter(
     (e) => e.sessionId === sessionId || (agent?.taskId != null && e.taskId === agent.taskId),
   );
-  const title = agent ? `Agent ${agent.role} (${agent.agentKind})` : "Agent";
+  const title = agent
+    ? `Agent ${agent.role} (${agent.agentKind}${agent.model ? ` · ${agent.model}` : ""})`
+    : "Agent";
   const live = agent ? LIVE.has(agent.status) : false;
 
   // Keyed so it keeps what it read when it moves below the state card as the session ends.

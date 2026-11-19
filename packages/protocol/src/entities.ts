@@ -188,11 +188,26 @@ export type CrewMember = z.infer<typeof CrewMemberSchema>;
  * deliver a Markdown report or `review.json` under `.mimir/artifacts/` instead of a diff and
  * skip verification; their worktree edits are never committed. `read` implies `document`.
  */
+/** Absolute directories outside its worktree a task may read (e.g. another project's snapshot). */
+export const ReadDirsSchema = z
+  .array(
+    z
+      .string()
+      .regex(/^\/[^\0]*$/)
+      .max(1024),
+  )
+  .max(16);
+
 export const TaskModeSchema = z
   .object({
     deliverable: z.enum(["diff", "document"]),
     access: z.enum(["write", "read"]),
     network: z.enum(["none", "web"]),
+    /**
+     * Absolute directories outside the worktree the agent may read (e.g. another project's
+     * read-only snapshot). Agents limited to their working directory get them added.
+     */
+    readDirs: ReadDirsSchema.optional(),
   })
   .meta({
     id: "TaskMode",
@@ -219,6 +234,11 @@ export const TaskSchema = entity(TaskIdSchema, {
   leaseExpiresAt: TimestampSchema.nullable(),
   /** Why a `blocked` task is blocked (e.g. `budget_exceeded`, or the runtime/approval reason). Absent otherwise. */
   blockedReason: z.string().min(1).optional(),
+  /**
+   * A task parked because its agent is unavailable (`agent_unavailable`): when Mimir releases it
+   * on its own, e.g. a usage limit's reset. Absent when only a fallback agent or a human can.
+   */
+  blockedUntil: TimestampSchema.optional(),
 }).meta({ id: "Task" });
 export type Task = z.infer<typeof TaskSchema>;
 
@@ -232,6 +252,8 @@ export const AgentSchema = entity(AgentIdSchema, {
   crewId: CrewIdSchema,
   role: CrewRoleSchema,
   agentKind: z.string().min(1),
+  /** The model the agent reported running, once it has (absent before, or when it never says). */
+  model: z.string().min(1).max(200).optional(),
   runtimeSessionId: SessionIdSchema.nullable(),
   status: RuntimeSessionStateSchema,
   taskId: TaskIdSchema.nullable(),

@@ -4,7 +4,7 @@
 
 Local-first mission control for crews of coding agents. Mutations require the `idempotency-key` header; asynchronous mutations return 202 with an OperationAccepted body.
 
-Contract version 0.5.0. Base path `/v1`. The contract is generated from the Zod schemas in `packages/protocol`.
+Contract version 0.5.1. Base path `/v1`. The contract is generated from the Zod schemas in `packages/protocol`.
 
 ## Conventions
 
@@ -32,6 +32,7 @@ The server serves every route in the contract below, plus the extra routes liste
 | `POST /v1/missions/{id}/decision-log` | served |
 | `POST /v1/missions/{id}/start` | served |
 | `POST /v1/missions/{id}/cancel` | served |
+| `POST /v1/missions/{id}/reopen` | served |
 | `POST /v1/crews` | served |
 | `GET /v1/crews` | served |
 | `POST /v1/crews/{id}/pause` | served |
@@ -355,6 +356,29 @@ Responses:
 ### POST /v1/missions/{id}/cancel
 
 Cancel a mission
+
+Status: served
+
+| Parameter | In | Type | Required | Notes |
+|---|---|---|---|---|
+| `id` | path | string | yes |  |
+| `idempotency-key` | header | string, min 1 | yes | Unique key per logical mutation; replays return the original result. |
+
+Request body:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `reason` | string | no |  |
+| `expectedVersion` | integer, min 0 | no |  |
+
+Responses:
+
+- `202` OK (application/json): [OperationAccepted](#operationaccepted)
+- `default` Error (application/json): [ApiErrorBody](#apierrorbody)
+
+### POST /v1/missions/{id}/reopen
+
+Restart a failed or cancelled mission: completed tasks stay done, the rest get fresh attempts
 
 Status: served
 
@@ -1008,6 +1032,7 @@ Responses:
 | `agentId` | string \| null | yes |  |
 | `leaseExpiresAt` | string \| null | yes |  |
 | `blockedReason` | string, min 1 | no |  |
+| `blockedUntil` | string | no |  |
 
 ### TaskMode
 
@@ -1018,6 +1043,7 @@ How a task runs. `document` tasks deliver a Markdown report (`.mimir/artifacts/*
 | `deliverable` | `diff` \| `document` | yes |  |
 | `access` | `write` \| `read` | yes |  |
 | `network` | `none` \| `web` | yes |  |
+| `readDirs` | string[] | no |  |
 
 ### TaskDependency
 
@@ -1041,6 +1067,7 @@ How a task runs. `document` tasks deliver a Markdown report (`.mimir/artifacts/*
 | `crewId` | string | yes |  |
 | `role` | `lead` \| `implementer` \| `reviewer` \| `qa` \| `investigator` | yes |  |
 | `agentKind` | string, min 1 | yes |  |
+| `model` | string, min 1 | no |  |
 | `runtimeSessionId` | string \| null | yes |  |
 | `status` | `requested` \| `starting` \| `idle` \| `running` \| `waiting` \| `blocked` \| `stopping` \| `stopped` \| `completed` \| `failed` \| `unknown` | yes |  |
 | `taskId` | string \| null | yes |  |
@@ -1134,7 +1161,7 @@ How a task runs. `document` tasks deliver a Markdown report (`.mimir/artifacts/*
 | `sequence` | integer, min 0 | yes |  |
 | `occurredAt` | string | yes |  |
 | `observedAt` | string | yes |  |
-| `type` | `mission.created` \| `mission.decision_log_requested` \| `mission.decision_log_pinned` \| `mission.started` \| `mission.paused` \| `mission.resumed` \| `mission.cancelled` \| `mission.completed` \| `task.created` \| `task.ready` \| `task.leased` \| `task.started` \| `task.blocked` \| `task.verifying` \| `task.completed` \| `task.failed` \| `task.cancelled` \| `task.retried` \| `session.requested` \| `session.started` \| `session.state_changed` \| `session.output` \| `session.exited` \| `session.lost` \| `tool.invoked` \| `tool.completed` \| `git.worktree_created` \| `git.worktree_removed` \| `git.commit_observed` \| `git.conflict_detected` \| `test.run_completed` \| `approval.requested` \| `approval.decided` \| `approval.expired` \| `budget.warning` \| `budget.exceeded` \| `policy.denied` \| `recovery.reconciled` \| `recovery.unknown_marked` \| `summary.created` \| `artifact.recorded` \| `mission.failed` \| `session.input` \| `project.created` \| `project.updated` \| `crew.created` \| `crew.scheduling_changed` \| `usage.recorded` \| `approval.consumed` \| `artifact.collection_skipped` \| `artifact.collection_truncated` \| `budget.updated` | yes |  |
+| `type` | `mission.created` \| `mission.decision_log_requested` \| `mission.decision_log_pinned` \| `mission.started` \| `mission.paused` \| `mission.resumed` \| `mission.cancelled` \| `mission.completed` \| `task.created` \| `task.ready` \| `task.leased` \| `task.started` \| `task.blocked` \| `task.verifying` \| `task.completed` \| `task.failed` \| `task.cancelled` \| `task.retried` \| `session.requested` \| `session.started` \| `session.state_changed` \| `session.output` \| `session.exited` \| `session.lost` \| `tool.invoked` \| `tool.completed` \| `git.worktree_created` \| `git.worktree_removed` \| `git.commit_observed` \| `git.conflict_detected` \| `test.run_completed` \| `approval.requested` \| `approval.decided` \| `approval.expired` \| `budget.warning` \| `budget.exceeded` \| `policy.denied` \| `recovery.reconciled` \| `recovery.unknown_marked` \| `summary.created` \| `artifact.recorded` \| `mission.failed` \| `session.input` \| `project.created` \| `project.updated` \| `crew.created` \| `crew.scheduling_changed` \| `usage.recorded` \| `approval.consumed` \| `artifact.collection_skipped` \| `artifact.collection_truncated` \| `budget.updated` \| `session.model_reported` \| `task.reopened` | yes |  |
 | `source` | string, min 1 | yes |  |
 | `sourceEventId` | string | no |  |
 | `provenance` | `observed` \| `derived` \| `summarized` | yes |  |
